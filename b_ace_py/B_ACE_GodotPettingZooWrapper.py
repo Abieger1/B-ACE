@@ -29,7 +29,7 @@ class B_ACE_GodotPettingZooWrapper(GodotEnv, ParallelEnv):
         self.action_repeat  = int(self.env_config.get("action_repeat", 20))  
         self.action_type    = self.env_config.get("action_type", "Low_Level_Continuous")  
         self.speedup        = int(self.env_config.get("speed_up", 1000))                          
-        self.parallel_envs  = int(self.env_config.get("parallel_envs", 1))          
+        self.parallel_envs  = int(self.env_config.get("parallel_envs", 1))   
         
         self.agents_config = config_kwargs.get("AgentsConfig", "")
         self._num_agents = int(self.agents_config["blue_agents"].get("num_agents", 1))
@@ -39,7 +39,10 @@ class B_ACE_GodotPettingZooWrapper(GodotEnv, ParallelEnv):
         
         self.additional_config = self.env_config.get("additional_config", "") 
         
-        self.port = B_ACE_GodotPettingZooWrapper.DEFAULT_PORT + random.randint(0,3100)                 
+        # FIX 1: Use port from config, don't randomize it!
+        self.port = int(self.env_config.get("port", 11008))
+       # print(f"DEBUG: Using port {self.port}")
+        
         self.proc = None
         
         if self.env_path is not None and self.env_path != "debug":
@@ -47,26 +50,57 @@ class B_ACE_GodotPettingZooWrapper(GodotEnv, ParallelEnv):
 
             self.check_platform(self.env_path)  
 
+            # FIX 2: Pass port to Godot via command line
+            #print(f"DEBUG: Launching Godot with port {self.port}")
             self._launch_env(self.env_path, self.port, self.show_window == 1, None, self._seed, self.action_repeat, self.speedup)
         else:
             print("No game binary has been provided, please press PLAY in the Godot editor")
         
         self.host_binding = config_kwargs.get("host_binding", False)
+        
+        # FIX 3: Add debug output for connection
+       # print(f"DEBUG: Starting server on port {self.port}...")
+       # print("DEBUG PY: (about to listen) port =", self.port)
         self.connection = self._start_server()
+       # print("DEBUG: Server started, connection established")
+       # print("DEBUG PY: socket bound, waiting for Godot connect...")
         self.num_envs = None
         
-        self._handshake()           
+        # FIX 4: Add debug output for handshake
+        #print("DEBUG: Performing handshake...")
+        self._handshake()
+        #print("DEBUG: Handshake complete")
         
         self.action_spaces = []
         self.observation_spaces = []     
-        self.send_sim_config(self.env_config, self.agents_config)                
+        
+        # FIX 5: Add debug output before sending config
+        #print("DEBUG: Sending simulation config to Godot...")
+        #print(f"DEBUG: env_config keys: {list(self.env_config.keys())}")
+       # print(f"DEBUG: agents_config keys: {list(self.agents_config.keys())}")
+        self.send_sim_config(self.env_config, self.agents_config)
+        #print("DEBUG: Config sent, waiting for environment info...")
         
         self.action_spaces = []
         self.observation_spaces = []
 
-        env_info = self._get_env_info()          
-                
+        env_info = self._get_env_info()
+        #print(f"DEBUG: Received env_info: {env_info.keys()}")
+        
         self.observation_labels = env_info["observation_labels"]
+        # --- expose a flat label list for agent_0 so wrappers can print index->name ---
+        first_key = str(101)  # agent_0 in your Godot labeling scheme
+        self.observation_labels_flat = list(self.observation_labels[first_key])
+        # ===== ONE-TIME OBSERVATION LABEL DUMP (DEBUG) =====
+        if not hasattr(self, "_printed_observation_labels"):
+            print("\n=== B-ACE Observation Labels (raw, from Godot) ===")
+            for agent_id, labels in self.observation_labels.items():
+                print(f"\nAgent key: {agent_id}")
+                for i, label in enumerate(labels):
+                    print(f"{i:>2}: {label}")
+            print("=== End Observation Labels ===\n")
+            self._printed_observation_labels = True
+        # ==================================================        self.action_spaces = env_info["action_spaces"]
                 
         self.tuple_action_spaces = [
             spaces.Tuple([v for _, v in action_space.items()]) for action_space in self.action_spaces
@@ -84,8 +118,41 @@ class B_ACE_GodotPettingZooWrapper(GodotEnv, ParallelEnv):
         self.agents = [f'agent_{i}' for i in range(self._num_agents)]  # Initialize agents
         self.possible_agents = self.agents[:]
         
+        # Now we can initialize _prev_missiles_fired since possible_agents exists
+        self._prev_missiles_fired = {a: 0 for a in self.possible_agents}
+        
                         
         self.obs_map= {agent : {label: index for index, label in enumerate(self.observation_labels[str(101 + i)])}  for i,agent in enumerate(self.possible_agents)}               
+
+
+    def get_hvaa_indices(self, agent_name: str):
+
+        # Use the existing label list under key '101'
+        labels = None
+        if hasattr(self, "observation_labels"):
+            labels = self.observation_labels.get("101", None)
+
+        if labels is None:
+            print("[get_hvaa_indices] WARNING: no labels for '101'; returning None")
+            return None
+
+        # Build label->index mapping
+        label_to_idx = {name: idx for idx, name in enumerate(labels)}
+
+        # Map the four HVAA-related names
+        required = ["hvaa_dist", "hvaa_alt_diff", "hvaa_angle_off", "hvaa_detected"]
+        missing = [r for r in required if r not in label_to_idx]
+        if missing:
+            print("[get_hvaa_indices] WARNING: missing HVAA labels:", missing)
+            return None
+
+        return {
+            "hvaa_dist": label_to_idx["hvaa_dist"],
+            "hvaa_alt_diff": label_to_idx["hvaa_alt_diff"],
+            "hvaa_angle_off": label_to_idx["hvaa_angle_off"],
+            "hvaa_detected": label_to_idx["hvaa_detected"],
+        }
+
 
         self.agent_idx = [ {agent : i} for i, agent in enumerate(self.possible_agents)]                 
         
@@ -98,29 +165,69 @@ class B_ACE_GodotPettingZooWrapper(GodotEnv, ParallelEnv):
         self.truncations =  {agent : False  for agent in self.possible_agents} 
         self.observations =  {agent : []  for agent in self.possible_agents}  
         self.info =  {agent : []  for agent in self.possible_agents}  
-        self.infos =  {agent : []  for agent in self.possible_agents}  
+        self.infos =  {agent : []  for agent in self.possible_agents}
+        
+        #print("DEBUG: Wrapper initialization complete!")
+
+        self._ep_step = 0
+        self._printed_ep_end = False
                             
     def send_sim_config(self, _env_config, _agents_config):
         message = {"type": "config"}        
         message["agents_config"] = _agents_config
         message["env_config"] = _env_config
+        
+        # FIX 6: Add debug output
+        #print(f"DEBUG: Sending config message: type={message['type']}")
         self._send_as_json(message)
+        
+        # FIX 7: Wait for acknowledgment
+        #print("DEBUG: Waiting for config acknowledgment...")
+        response = self._get_dict_json_message()
+        #print(f"DEBUG: Received response: {response}")
+        
+        if response.get("type") != "ack":
+            print(f"WARNING: Expected 'ack' response, got '{response.get('type')}'")
             
-        
-    def reset(self, seed=0, options = None):
-        
-        result  = super().reset()
     
-        self.observations = {}          
-        
-        for i, indiv_obs in enumerate(result[0]):
-                        
-            self.observations[self.possible_agents[i]] = {"obs": indiv_obs["obs"], "mask": [True for _ in range(4)]}
-            #self.observations[self.possible_agents[i]] =  indiv_obs["obs"] 
-            self.info[self.possible_agents[i]] = {self.possible_agents[i]}                  
-        # Assuming the reset method returns a dictionary of observations for each agent        
-                
-        return self.observations, self.info  
+    def reset(self, seed=0, options=None):
+        #print("DEBUG: Calling reset...")
+        obs_dict, _info_from_base = super().reset()
+        #print("DEBUG: Reset complete, processing observations...")
+
+        # obs_dict right now looks like:
+        # { "agent_0": [ ... ], "agent_1": [ ... ], ... }
+
+        self.observations = {}
+        self.info = {}
+
+        for agent_name in self.possible_agents:
+            if agent_name not in obs_dict:
+                print(f"WARNING: {agent_name} not in obs_dict from Godot; filling zeros")
+                self.observations[agent_name] = {
+                    "obs": [],
+                    "mask": [True for _ in range(4)]
+                }
+                self.info[agent_name] = {}
+                continue
+
+            raw_obs = obs_dict[agent_name]
+
+            # Wrap it like a policy would expect
+            self.observations[agent_name] = {
+                "obs": raw_obs,
+                "mask": [True for _ in range(4)]
+            }
+
+            self.info[agent_name] = {}
+
+        # ParallelEnv.reset() should return (observations, infos)
+        self._ep_step = 0
+        self._printed_ep_end = False
+
+        return self.observations, self.info
+    
+
     
     
     def _observation_space(self, agent):        
@@ -133,36 +240,124 @@ class B_ACE_GodotPettingZooWrapper(GodotEnv, ParallelEnv):
         self.seed = _seed
     
     def step(self, actions, order_ij=True):
-                
-        # Assuming the environment's step function can handle a dictionary of actions for each agent                                      
-        if self.action_type == "Low_Level_Continuous":            
-            godot_actions = np.array([np.array([action]) for agent, action in actions.items()])  
-                   
-        elif self.action_type == "Low_Level_Discrete": 
-            godot_actions = [ self.decode_action(action) for agent, action in actions.items()]            
+        if self.action_type == "Low_Level_Continuous":
+            # Build list: per-agent -> [ per-head payloads ]
+            # Single head "input" => wrap the 4-vector in a list
+            godot_actions = []
+            for agent_name in self.possible_agents:
+                a = np.asarray(actions[agent_name], dtype=np.float32)  # shape (4,)
+                godot_actions.append([a])  # <-- NOTE the extra [ ... ] for the head
+
+        elif self.action_type == "Low_Level_Discrete":
+            ordered = []
+            for agent_name in self.possible_agents:
+                ordered.append(self.decode_action(actions[agent_name]))
+            # For discrete if the action space has a single head, you should ALSO wrap once:
+            godot_actions = [[np.asarray(ordered[i], dtype=np.int32)]
+                            for i in range(len(ordered))]
         else:
-            print("GododtPZWrapper::Error:: Unknow Actions Type -> ", self.actions_type) 
-               
-        self.rewards = 0                               
+            print("GodotPZWrapper::Error:: Unknown Actions Type -> ", self.action_type)
+
         obs, reward, dones, truncs, info = super().step(godot_actions, order_ij=order_ij)
         
-      
-                
+        # DEBUG ==================================
+       # Count agent-steps (ParallelEnv step)
+        self._ep_step += 1
+
+        # CRITICAL FIX: Convert info to proper dict format BEFORE using it
+        if isinstance(info, list):
+            info_dict = {}
+            for i, agent_name in enumerate(self.agents):
+                if i < len(info) and isinstance(info[i], dict):
+                    info_dict[agent_name] = info[i]
+                else:
+                    info_dict[agent_name] = {}
+            info = info_dict
+        elif not isinstance(info, dict):
+            info = {agent_name: {} for agent_name in self.agents}
+
+        # --- OPTION A termination gating: define episode_over ALWAYS ---
+        episode_over = any(
+            bool(info.get(a, {}).get("episode_over", False))
+            for a in self.possible_agents
+        )
+
+        # Check if any agent is done/truncated (diagnostic only)
+        _any_done   = any(bool(dones.get(a, False))  for a in self.possible_agents)
+        _any_trunc  = any(bool(truncs.get(a, False)) for a in self.possible_agents)
+
+        # This is now the real episode end condition
+        _episode_end = episode_over
+
+        # Apply gating to dones/truncs
+        if not episode_over:
+            for a in self.possible_agents:
+                dones[a] = False
+                truncs[a] = False
+        else:
+            for a in self.possible_agents:
+                dones[a] = True
+                truncs[a] = False
+
+        # --- Derive a per-step 'missile_fired' flag for each agent ---
+        for agent_name in self.possible_agents:
+            ai = info.get(agent_name, {})
+
+            # TODO: replace 'missiles_fired_total' with the actual key
+            # you get from Godot info (e.g. 'blue_missiles_fired', 'weapons_expended', etc.)
+            cur_total = ai.get("missiles_fired_total", 0)
+
+            prev_total = self._prev_missiles_fired.get(agent_name, 0)
+            fired_this_step = cur_total > prev_total
+
+            ai["missile_fired"] = bool(fired_this_step)
+            info[agent_name] = ai
+
+            self._prev_missiles_fired[agent_name] = cur_total
+        # --- end missile_fired derivation ---
+
+
+        # On first episode end, print a compact reason line
+        if _episode_end and not self._printed_ep_end:
+            self._printed_ep_end = True
+
+            # Try to pull a sim clock if Godot passes one
+            sim_time = None
+            for a in self.possible_agents:
+                if a in info and isinstance(info[a], dict):
+                    sim_time = info[a].get("sim_time_sec") or info[a].get("sim_time") or sim_time
+
+            # Collect per-agent reasons if present
+            reasons = []
+            for a in self.possible_agents:
+                ai = info.get(a, {})
+                r = ai.get("termination_reason") or ai.get("reason") or ai.get("end_reason")
+                if r:
+                    reasons.append(f"{a}:{r}")
+            reason_str = "; ".join(reasons) if reasons else "unknown"
+
+            print(f"[EP-END] steps={self._ep_step} any_done={_any_done} any_trunc={_any_trunc} "
+                f"sim_time={sim_time} reasons=[{reason_str}]")
+    
+        # Process observations
         self.observations = {agent_name : {"obs": _obs["obs"], "mask": [True for _ in range(4)]} for agent_name, _obs in obs.items()}
         
+        # Aggregate termination/truncation flags
         self.terminations = False
         self.truncations = False        
         self.rewards = 0.0
         
         for i, agent in enumerate(self.possible_agents):
-            
             self.terminations = self.terminations or dones[agent]
             self.truncations = self.truncations and truncs[agent]           
-                        
-            self.rewards += reward[agent]   
+            self.rewards += reward[agent]
+        
+       
+        self.info = info
             
-        return self.observations, self.rewards, self.terminations, self.truncations, self.info 
-    
+        return self.observations, self.rewards, self.terminations, self.truncations, self.info
+
+
     def _process_obs(self, response_obs):
         return response_obs
     

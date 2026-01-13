@@ -1,6 +1,4 @@
 extends Node
-
-#const Calc = preload("res://assets/Calc.gd") # Ensure you have a Calc script for calculations
 class SimGroups:
 	
 	var BLUE
@@ -180,6 +178,23 @@ class Track:
 		own_missile_Nez		= wez_ranges[1] * SConv.NM2GDM
 		enemy_missile_RMax	= wez_ranges[2] * SConv.NM2GDM
 		enemy_missile_Nez	= wez_ranges[3] * SConv.NM2GDM
+		
+		# === ADD DEBUG ===
+		#if obj.is_hvaa:
+			#print("Track update for HVAA: enemy_RMax=", enemy_missile_RMax / SConv.NM2GDM, "nm BEFORE fix")
+		# =================
+	
+		
+	# If tracking an HVAA, override threat to zero
+		if obj.is_hvaa:
+			enemy_missile_RMax = 0.001
+			enemy_missile_Nez = 0.001
+	# ==============================
+	
+			# === ADD DEBUG ===
+		#if obj.is_hvaa:
+			#print("Track update for HVAA: enemy_RMax=", enemy_missile_RMax / SConv.NM2GDM, "nm AFTER fix (should be tiny)")
+	# =================
 						
 		if dist <= own_missile_RMax:
 			if dist > own_missile_Nez and own_missile_Nez != own_missile_RMax:				
@@ -189,7 +204,7 @@ class Track:
 		else:
 			offensive_factor = 0.5 * exp(-2.0 * ((dist - own_missile_RMax)/own_missile_RMax))
 			#threat_factor = 0.5 * own_missile_RMax / dist
-					
+		
 		if dist <= enemy_missile_RMax:
 			if dist > enemy_missile_Nez and enemy_missile_Nez != enemy_missile_RMax:				
 				threat_factor = 1.0 - 0.5 * (dist - enemy_missile_Nez) / (enemy_missile_RMax - enemy_missile_Nez)
@@ -198,9 +213,13 @@ class Track:
 		else:
 			threat_factor = 0.5 * exp(-2.0 * ((dist- enemy_missile_RMax)/enemy_missile_RMax))
 			#threat_factor = 0.5 * own_missile_RMax / dist
-		if offensive_factor > 2:
-			print([own_missile_RMax, own_missile_Nez, enemy_missile_RMax, enemy_missile_Nez], [dist])
-			print("Factors:", [offensive_factor, threat_factor])
+			# === ADD DEBUG AT END ===
+		#if obj.is_hvaa:
+			#print("Track for HVAA: threat_factor=", threat_factor, " (should be near 0)")
+		# ======================
+		#if offensive_factor > 2:
+			#print([own_missile_RMax, own_missile_Nez, enemy_missile_RMax, enemy_missile_Nez], [dist])
+			#print("Factors:", [offensive_factor, threat_factor])
 		
 	func detected_status(_detected):
 		self.detected = _detected
@@ -226,6 +245,8 @@ class RewardsControl:
 	const DEFAULT_HIT_ENEMY_FACTOR := 3.0
 	const DEFAULT_HIT_OWN_FACTOR := -5.0	
 	const DEFAULT_MISSION_ACCOMPLISHED_FACTOR := 10.0
+	const DEFAULT_HVAA_LOSS_FACTOR := -10.0
+	const DEFAULT_HVAA_PROXIMITY_FACTOR := 0.01
 	
 	var printRewards = false
 	var cumulated_rewards = 0.0
@@ -246,8 +267,11 @@ class RewardsControl:
 	var hit_enemy_factor: float
 	var hit_own_factor: float	
 	var mission_accomplished_factor: float
+	var hvaa_loss_factor: float
 	var Owner_obj = null
 	var max_cycles = 36000.0 / 20.0
+	var hvaa_proximity_factor: float
+	var hvaa_proximity = 0.0
 
 	func _init(config, _owner_obj):
 						
@@ -261,6 +285,8 @@ class RewardsControl:
 		self.hit_enemy_factor = config.get("hit_enemy_factor", DEFAULT_HIT_ENEMY_FACTOR)
 		self.hit_own_factor = config.get("hit_own_factor", DEFAULT_HIT_OWN_FACTOR)
 		self.mission_accomplished_factor = config.get("mission_accomplished_factor", DEFAULT_MISSION_ACCOMPLISHED_FACTOR)		
+		self.hvaa_loss_factor = config.get("hvaa_loss_factor", DEFAULT_HVAA_LOSS_FACTOR)
+		self.hvaa_proximity_factor = config.get("hvaa_proximity_factor", DEFAULT_HVAA_PROXIMITY_FACTOR)
 		
 		self.Owner_obj = _owner_obj		
 		max_cycles = _owner_obj.max_cycles
@@ -279,7 +305,11 @@ class RewardsControl:
 		
 	func add_detect_loss_rew(multiplier = 1.0):
 		detect_loss += detect_loss_factor * multiplier
-		
+	func add_hvaa_proximity_rew(distance_to_hvaa_nm: float, optimal_range_nm: float = 10.0):
+		# Using a Gaussian-like function
+		var distance_factor = exp(-pow(distance_to_hvaa_nm - optimal_range_nm, 2) / (2 * pow(optimal_range_nm / 2, 2)))
+		hvaa_proximity += hvaa_proximity_factor * distance_factor
+	
 	func add_keep_track_rew():
 		keep_track += keep_track_factor
 					
@@ -291,7 +321,7 @@ class RewardsControl:
 				
 	func get_step_rewards():
 		var step_rewards = mission + missile_fire + missile_miss + keep_track +\
-							detect_loss + hit_enemy + hit_own + final_reward
+							detect_loss + hit_enemy + hit_own + hvaa_proximity + final_reward
 		
 		#print( [mission, missile_fire, missile_miss, keep_track,\
 		#					detect_loss, hit_enemy, hit_own, final_reward])
@@ -305,6 +335,7 @@ class RewardsControl:
 		detect_loss = 0.0
 		keep_track = 0.0
 		hit_enemy = 0.0
+		hvaa_proximity = 0.0  
 		hit_own = 0.0		
 		final_reward = 0.0
 				
@@ -319,6 +350,7 @@ class RewardsControl:
 		detect_loss = 0.0
 		keep_track = 0.0
 		hit_enemy = 0.0
+		hvaa_proximity = 0.0
 		hit_own = 0.0		
 		final_reward = 0.0
 		
@@ -339,11 +371,16 @@ class RewardsControl:
 			final_reward -= mission_accomplished_factor
 			final_reward += (missile_miss_factor * missiles_remaining)
 			#print("Figther::Info::TEAM_Killed Rewards -> ", final_reward )			
+		elif condition == "HVAA_Mission_Success":
+	# HVAA survives and reaches target distance
+			final_reward += mission_accomplished_factor
+			final_reward += (keep_track_factor + mission_factor) * missing_cycles
+		
+		elif condition == "HVAA_Destroyed":
+			final_reward += hvaa_loss_factor
 		
 		elif condition == "Max_Cycles":
-			final_reward += mission_accomplished_factor
+			final_reward += 0
 			#print("Figther::Info::Rewards Added Max_Cycles -> ", final_reward )
 		else:
-			print("Figther::Warning Trying to add unknow final reward (", condition , ")")			
-
-	
+			print("Figther::Warning Trying to add unknow final reward (", condition , ")")	

@@ -12,7 +12,7 @@ config_version=5
 
 config/name="B_ACE"
 run/main_scene="res://B_ACE.tscn"
-config/features=PackedStringArray("4.4")
+config/features=PackedStringArray("4.5")
 run/low_processor_mode_sleep_usec=1
 config/icon="res://icon.png"
 
@@ -29,13 +29,17 @@ project/assembly_name="FlyBy"
 
 [editor]
 
-movie_writer/mjpeg_quality=1.0
 movie_writer/movie_file="D:/Projects/B-ACE/B-ACE/BVR_AirCombat/Recorders/Record01.avi"
 movie_writer/fps=15
+movie_writer/mjpeg_quality=1.0
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/godot_rl_agents/plugin.cfg")
+enabled=PackedStringArray("res://addons/GPTIntegration/plugin.cfg", "res://addons/godot_rl_agents/plugin.cfg")
+
+[filesystem]
+
+import/blender/enabled=false
 
 [input]
 
@@ -105,6 +109,7 @@ common/enable_pause_aware_picking=true
 
 [rendering]
 
+textures/vram_compression/import_etc2_astc=true
 global_illumination/sdfgi/frames_to_update_lights=3
 quality/filters/use_fxaa=true
 environment/default_environment="res://default_env.tres"

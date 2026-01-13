@@ -1,5 +1,18 @@
 extends CharacterBody3D
 
+# ----- DEBUG TOGGLES -----
+var DBG_ON := false
+var DBG_ONCE_AFTER_RESET := false
+var DBG_THROTTLE_STEPS := 50  # how often to print in physics loop
+var DBG_ALLOW_FORCE_FIRE := false        # fire no matter what when shoot_input>0
+var DBG_FIRE_IGNORE_DETECTION := false   # allow range-only blind fire
+var DBG_FIRE_MAX_RANGE_NM := 80.0        # used when IGNORE_DETECTION=true
+
+func _dbg(msg):
+	if DBG_ON:
+		print("[DBG][F", id, "] ", msg)
+# -----------------------
+
 const missile = preload("res://components/missile.tscn")
 const Track   = preload("res://assets/Sim_assets.gd").Track
 const SConv   = preload("res://assets/Sim_assets.gd").SConv
@@ -98,8 +111,8 @@ var strike_line_xR = 0.0
 var target_position = Vector3.ZERO
 
 var done = false
-var _heuristic = "AP" #"model" / "AP"
-var behavior = "baseline1" # baseline1 / external
+var _heuristic = "model" #"model" / "AP"
+var behavior = "external" # baseline1 / external
 var mission = "DCA" #"striker"
 
 var dShot 	= 0.85
@@ -122,6 +135,17 @@ var killed = false
 
 var team_color
 var team_color_group
+
+# ---- Python/Config integration toggles & overrides ----
+var is_hvaa: bool = false                    # Asset/target plane (no weapons, constant flight)
+var const_speed: float = -1.0                # If >=0, lock speed in GDM/s; else compute from altitude
+var const_speed_kts: float = 0.0
+var const_hdg_deg: float = 0.0               # Constant heading (deg) if is_hvaa or if const_hdg_enable
+var const_hdg_enable: bool = false           # If true, lock heading to const_hdg_deg
+var missiles_from_cfg: int = -1              # If >=0, use this at reset/reactivate
+var max_speed_override: float = -1.0         # If >=0, override max_speed
+var radar_range_override: float = -1.0       # If >=0, override radar_range
+var action_type_override: String = ""        # If set, override action_type
 
 #Heuristic Behavior Params
 #var max_shoot_range = 30 *  SConv.NM2GDM
@@ -205,84 +229,115 @@ func _ready():
 	get_parent().get_parent().add_child(trail_node)
 	renderize = b_ace_sync.renderize
 			
+func _get_radar_node() -> Node3D:
+	var n := get_node_or_null("Radar")
+	if n == null:
+		n = find_child("Radar", true, false)  # recursive search
+	return n
 	
-func update_init_config(config, rewConfig = {}):
-		
+func _apply_hvaa_overrides() -> void:
+	if !is_hvaa:
+		return
+	var radar := _get_radar_node()
+	if radar:
+		radar.visible = false
+
+func update_init_config(config: Dictionary, rewConfig: Dictionary = {}):
 	init_config = config
-	
-	var offset_pos = init_config["offset_pos"] 		
-	var init_pos = init_config["init_position"]	
-	init_position = Vector3((offset_pos.x + init_pos["x"]) * SConv.NM2GDM , 
-							(offset_pos.y + init_pos["y"]) * SConv.FT2GDM , 
-							(offset_pos.z + init_pos["z"]) * SConv.NM2GDM )	
-		
-	var _init_hdg = init_config["init_hdg"]												
-	init_rotation = Vector3(0, _init_hdg, 0)				
+
+	is_hvaa = bool(init_config.get("is_hvaa", false))
+	const_hdg_enable = bool(init_config.get("const_hdg_enable", false))
+	const_hdg_deg = float(init_config.get("const_hdg_deg", 0.0))
+	const_speed_kts = float(init_config.get("const_speed", 0.0))
+
+
+	# --- positions/heading/target with safe defaults
+	var offset_pos: Vector3 = config.get("offset_pos", Vector3.ZERO)
+	var init_pos: Dictionary = config.get("init_position", {"x": 0.0, "y": 25000.0, "z": 0.0})
+	init_position = Vector3(
+		(offset_pos.x + float(init_pos.get("x", 0.0))) * SConv.NM2GDM,
+		(offset_pos.y + float(init_pos.get("y", 25000.0))) * SConv.FT2GDM,
+		(offset_pos.z + float(init_pos.get("z", 0.0))) * SConv.NM2GDM
+	)
+
+	var _init_hdg := float(config.get("init_hdg", 0.0))
+	init_rotation = Vector3(0, _init_hdg, 0)
 	init_hdg = _init_hdg
 	hdg_input = _init_hdg
-	current_hdg = init_hdg			
-								
-	var target_pos = Vector3(init_config["target_position"]["x"] * SConv.NM2GDM,
-							 init_config["target_position"]["y"] * SConv.FT2GDM,
-							 init_config["target_position"]["z"] * SConv.NM2GDM)		
-	
-	target_position = target_pos
-	
-	#10NM before target 
-	strike_line_z = target_pos.z - (sign(target_pos.z) * 15 * SConv.NM2GDM )
-	strike_line_xL = target_pos.x - 60 * SConv.NM2GDM
-	strike_line_xR = target_pos.x + 60 * SConv.NM2GDM
-	
-	shoot_range_variation 	= init_config['rnd_shot_dist_var']
-	crank_variation 		= init_config['rnd_crank_var']
-	break_variation		 	= init_config['rnd_break_var']
-	
-	#Prepare WEZ models	
-	var input_data = ["blue_alt","diffAlt" ,"cosAspect" ,"sinAspect" ,"cosAngleOff", "sinAngleOff"]
-		
-	var wezModels = load_json_file(init_config['wez_models'])	
-	
-	rMax_calc = Expression.new()
-	rMax_calc.parse(wezModels["RMAX_MODEL"], input_data)	
-		
-	rNez_calc = Expression.new()
-	rNez_calc.parse(wezModels["RNEZ_MODEL"], input_data)	
-	
-	set_behavior(init_config["base_behavior"])
-	share_tracks = init_config["share_tracks"] == 1
-	share_states = init_config["share_states"] == 1
-	
-	dShotList  = init_config["beh_config"]["dShot"]
-	lCrankList = init_config["beh_config"]["lCrank"]
-	lBreakList = init_config["beh_config"]["lBreak"]
-	
-	if typeof(dShotList) != TYPE_ARRAY:
-		dShotList = [dShotList]
-	if typeof(lCrankList) != TYPE_ARRAY:
-		lCrankList = [lCrankList]
-	if typeof(lBreakList) != TYPE_ARRAY:
-		lBreakList = [lBreakList]
-			
-	dShot  = dShotList[0]
-	lCrank = lCrankList[0]
-	lBreak = lBreakList[0]
-	
-	mission = init_config["mission"]		
-	
-	ownRewards = RewardsControl.new(rewConfig,self)	
+	current_hdg = init_hdg
 
+	var target_pos: Dictionary = config.get("target_position", {"x": 0.0, "y": 25000.0, "z": 0.0})
+	target_position = Vector3(
+		float(target_pos.get("x", 0.0)) * SConv.NM2GDM,
+		float(target_pos.get("y", 25000.0)) * SConv.FT2GDM,
+		float(target_pos.get("z", 0.0)) * SConv.NM2GDM
+	)
+
+	# 10NM before target and lateral gates
+	strike_line_z = target_position.z - (sign(target_position.z) * 15.0 * SConv.NM2GDM)
+	strike_line_xL = target_position.x - 60.0 * SConv.NM2GDM
+	strike_line_xR = target_position.x + 60.0 * SConv.NM2GDM
+
+	# --- random behavior knobs with defaults
+	shoot_range_variation = float(config.get("rnd_shot_dist_var", 0.025))
+	crank_variation       = float(config.get("rnd_crank_var", 0.025))
+	break_variation       = float(config.get("rnd_break_var", 0.025))
+
+	# --- WEZ models (optional)
+	var wez_path := String(config.get("wez_models", "res://assets/wez/Default_Wez_params.json"))
+	var wezModels: Dictionary = load_json_file(wez_path)
+	
+	
+	if wezModels != null:
+		var input_names = ["blue_alt","diffAlt","cosAspect","sinAspect","cosAngleOff","sinAngleOff"]
+		rMax_calc = Expression.new()
+		rMax_calc.parse(wezModels.get("RMAX_MODEL", "1.0"), input_names)
+		rNez_calc = Expression.new()
+		rNez_calc.parse(wezModels.get("RNEZ_MODEL", "1.0"), input_names)
+
+	# --- behavior sharing & mode
+	set_behavior(String(config.get("base_behavior", "baseline1")))
+	share_tracks = int(config.get("share_tracks", 1)) == 1
+	share_states = int(config.get("share_states", 1)) == 1
+	mission      = String(config.get("mission", "DCA"))
+
+	# --- behavior parameter lists (with sane defaults)
+	var beh_cfg: Dictionary = config.get("beh_config", {})
+	dShotList  = beh_cfg.get("dShot",  [dShot])
+	lCrankList = beh_cfg.get("lCrank", [lCrank])
+	lBreakList = beh_cfg.get("lBreak", [lBreak])
+	if typeof(dShotList) != TYPE_ARRAY:  dShotList = [dShotList]
+	if typeof(lCrankList) != TYPE_ARRAY: lCrankList = [lCrankList]
+	if typeof(lBreakList) != TYPE_ARRAY: lBreakList = [lBreakList]
+	dShot  = float(dShotList[0])
+	lCrank = float(lCrankList[0])
+	lBreak = float(lBreakList[0])
+
+	# --- allow JSON to override missile count (HVAA uses 0)
+	missiles = int(config.get("missiles", missiles))
+
+	# --- rewards object
+	ownRewards = RewardsControl.new(rewConfig, self)
+
+	# --- HVAA visualization ---
+	is_hvaa = bool(config.get("is_hvaa", false))
+	if is_hvaa:
+		team_color = Color(0.0, 1.0, 0.0, 1.0)  # bright green
+	_apply_hvaa_overrides()
+	if is_hvaa and has_node("Radar"):
+		$Radar.visible = false
+
+
+	# --- visuals
 	update_trail_obj()
-	
-	var target_marker = Marker.instantiate()	
+	var target_marker = Marker.instantiate()
 	var material = target_marker.get_active_material(0)
-	var new_material = material.duplicate()  # Duplicate to avoid changing the original material used elsewhere.
-	new_material.albedo_color = trail_color						
+	var new_material = material.duplicate()
+	new_material.albedo_color = trail_color
 	target_marker.set_surface_override_material(0, new_material)
-		
 	trail_points = []
-
-	manager.get_parent().add_child(target_marker)										
-	target_marker.global_position = target_pos
+	manager.get_parent().add_child(target_marker)
+	target_marker.global_position = target_position
 
 func set_behavior(_behavior):	
 	
@@ -299,28 +354,44 @@ func reset():
 	needs_reset = false
 	test_executed = false
 	
+	_dbg("RESET: init_position=" + str(init_position) 
+		+ " current_pos=" + str(global_transform.origin)
+		+ " behavior=" + behavior
+		+ " missiles=" + str(missiles))
+	
 	var root_node = $RenderModel  # Adjust the path to your model's root node.		
 	change_mesh_instance_colors(root_node, team_color)
 		
 	var local_offset = Vector3(0.0,0.0,0.0)
 	
+		# If this fighter is a non-maneuvering asset (HVAA/target), neutralize combat
+	if is_hvaa:
+		behavior     = "test"     # disables tactical FSM
+		_heuristic   = "AP"       # keep autopilot to fly heading/level
+		AP_mode      = "FlyHdg"
+		missiles     = 0          # cannot shoot
+		shoot_input  = 0
+	
+	local_offset = Vector3.ZERO
+	
 	if behavior == "duck" or behavior == "baseline1" or behavior == "baseline2":
-				
-		var rnd_offset = Vector3(init_config['rnd_offset_range']['x'],
-								 init_config['rnd_offset_range']['y'],
-								 init_config['rnd_offset_range']['z'])
-		
+		var rnd_dict: Dictionary = init_config.get("rnd_offset_range", {"x":0.0,"y":0.0,"z":0.0})
+		var rnd_offset = Vector3(
+			float(rnd_dict.get("x", 0.0)),
+			float(rnd_dict.get("y", 0.0)),
+			float(rnd_dict.get("z", 0.0))
+		)
+
 		var x_offset = randf_range(-rnd_offset.x * SConv.NM2GDM, rnd_offset.x * SConv.NM2GDM)
 		var z_offset = randf_range(-rnd_offset.z * SConv.NM2GDM, rnd_offset.z * SConv.NM2GDM)
-		var y_offset = randf_range(-rnd_offset.y * SConv.FT2GDM, rnd_offset.y * SConv.FT2GDM)		
-		local_offset = Vector3(x_offset,y_offset, z_offset)
-		
+		var y_offset = randf_range(-rnd_offset.y * SConv.FT2GDM, rnd_offset.y * SConv.FT2GDM)
+		local_offset = Vector3(x_offset, y_offset, z_offset)
+
 		if behavior == "baseline1" or behavior == "baseline2":
-			
 			var agent_idx = randi_range(0, len(dShotList) - 1)
-			dShot  = dShotList[agent_idx]
-			lCrank = lCrankList[agent_idx]
-			lBreak = lBreakList[agent_idx]
+			dShot  = float(dShotList[agent_idx])
+			lCrank = float(lCrankList[agent_idx])
+			lBreak = float(lBreakList[agent_idx])
 		
 	position = init_position + 	local_offset
 	
@@ -329,19 +400,29 @@ func reset():
 	elif position.y > max_level:
 		position.y = max_level
 	
-	hdg_input 		= -init_rotation.y
-	last_hdg_input 	= hdg_input	
-	current_hdg 	= hdg_input
-	current_level 	= position.y
-	level_input 	= current_level
-	current_pitch 	= 0.0
-	current_time    = 0.0
-	
-	current_speed = max_speed * altitude_speed_factor(current_level)		
-	velocity = -transform.basis.z.normalized()* current_speed
+	# Use the heading we already computed in update_init_config()
+	rotation_degrees = init_rotation
 
-	rotation_degrees = init_rotation#Vector3(0, 0, 0) # Adjust as necessary			
-	dist2go = Calc.distance2D_to_pos(global_transform.origin, target_position)			
+	# After we apply rotation_degrees, update transform basis so velocity points the right way
+	current_hdg      = init_hdg       # no sign flip
+	hdg_input        = init_hdg
+	last_hdg_input   = hdg_input
+
+	position         = init_position + local_offset
+	global_transform.origin = position
+
+	current_level    = position.y
+	level_input      = current_level
+	current_pitch    = 0.0
+	current_time     = 0.0
+
+	# Now recompute speed/velocity after heading is applied
+	current_speed = max_speed * altitude_speed_factor(current_level)
+	velocity = -transform.basis.z.normalized() * current_speed
+	set_velocity(velocity)
+
+	dist2go = Calc.distance2D_to_pos(global_transform.origin, target_position)
+
 	
 	n_steps = 0
 	done = false
@@ -374,22 +455,42 @@ func reset():
 	trail_points = []
 	
 	_reset_visuals()
+	_apply_hvaa_overrides()
+	
+	# --- DEBUG: snapshot right after reset/apply spawn ---
+	if DBG_ONCE_AFTER_RESET:
+		DBG_ONCE_AFTER_RESET = false
+		_dbg("RESET state: pos(GDM)=" + str(global_transform.origin)
+			+ " alt_ft≈" + str(global_transform.origin.y / SConv.FT2GDM)
+			+ " hdg=" + str(current_hdg)
+			+ " spd_gdmps≈" + str(current_speed)
+			+ " radar_range_nm=" + str(radar_range / SConv.NM2GDM)
+			+ " hfov=" + str(radar_hfov) + " vfov=" + str(radar_vfov)
+			+ " missiles=" + str(missiles)
+			+ " behavior=" + str(behavior) + " is_hvaa=" + str(is_hvaa))
 	
 func update_scene(_tree):
 				
 	tree = _tree		
 	var track_view_list
-	if is_in_group(simGroups.ENEMY):
-		track_view_list = manager.agents
-	elif is_in_group(simGroups.AGENT):
-		track_view_list = manager.enemies
+	if team_id == 1:  # RED fighter tracks BLUE side (includes HVAAs)
+		track_view_list = manager.teams_agents[0]
+	elif team_id == 0:  # BLUE fighter tracks RED side
+		track_view_list = manager.teams_agents[1]
 	else:
-		print("FIGTHER::WARNING::COMPONENT IN UNKNOW GROUP ", get_groups())								
+		print("FIGTHER::WARNING::COMPONENT IN UNKNOW GROUP ", get_groups())
+		track_view_list = []	
 	
 	radar_track_list = []
 	for comp in track_view_list:		
 		var new_track = Track.new(comp.id, self, comp)					
 		radar_track_list.append(new_track)
+		if DBG_ON and manager != null:
+	# first-frame geometric snapshot; detection will be evaluated later
+			_dbg("TRACK init id=" + str(new_track.id)
+				+ " dist_nm≈" + str(new_track.dist / SConv.NM2GDM)
+				+ " aspect=" + str(new_track.aspect_angle)
+				+ " v_aspect=" + str(new_track.vert_aspect_angle))
 								
 	allied_track_list = []
 	for agent in tree.get_nodes_in_group(team_color_group):
@@ -405,6 +506,13 @@ func get_done():
 	
 func set_done_false():
 	done = false
+	
+func _find_hvaa_track():
+	# Look for an allied track whose underlying object is flagged as HVAA
+	for trk in allied_track_list:
+		if trk.obj != null and trk.obj.get("is_hvaa", false):
+			return trk
+	return null
 	
 func get_obs(with_labels = false):
 	
@@ -441,6 +549,52 @@ func get_obs(with_labels = false):
 				["allied_track_dist2go_" + str(track.id), 0.5],
 				["allied_track_detected_" + str(track.id), 0]
 			])
+	
+		# --- Explicit HVAA info block (PERFECT INFORMATION VERSION) ---
+	var hvaa_info = []
+	
+	# Get HVAA directly from manager (perfect info, no tracking required)
+	if manager != null and manager.hvaa_assets.size() > 0:
+		var hvaa = manager.hvaa_assets[0]  # Get first HVAA
+		
+		# Check if HVAA is still alive/active
+		if hvaa.activated and not hvaa.get_done():
+			# Get positions
+			var hvaa_pos = hvaa.global_transform.origin
+			var own_position = global_transform.origin
+			
+			# Compute relative information
+			var hvaa_dist = own_position.distance_to(hvaa_pos)
+			var hvaa_alt_diff = own_position.y - hvaa_pos.y
+			
+			# Compute angle from agent to HVAA
+			var hvaa_bearing = Calc.get_hdg_2d(own_position, hvaa_pos)
+			var hvaa_angle_off = Calc.get_2d_aspect_angle(current_hdg, hvaa_bearing)
+			
+			# Get HVAA's heading (perfect info)
+			var hvaa_heading = hvaa.current_hdg
+			
+			# Normalize for neural network
+			hvaa_info.append(["hvaa_dist", hvaa_dist / 3000.0])
+			hvaa_info.append(["hvaa_alt_diff", hvaa_alt_diff / 150.0])
+			hvaa_info.append(["hvaa_angle_off", hvaa_angle_off / 180.0])
+			hvaa_info.append(["hvaa_heading", hvaa_heading / 180.0])  # NEW: HVAA heading
+			hvaa_info.append(["hvaa_detected", 1.0])  # Always 1 (perfect info)
+		else:
+			# HVAA destroyed or inactive
+			hvaa_info.append(["hvaa_dist", -1.0])
+			hvaa_info.append(["hvaa_alt_diff", 0.0])
+			hvaa_info.append(["hvaa_angle_off", 0.0])
+			hvaa_info.append(["hvaa_heading", 0.0])
+			hvaa_info.append(["hvaa_detected", 0.0])
+	else:
+		# No HVAA in scenario
+		hvaa_info.append(["hvaa_dist", -1.0])
+		hvaa_info.append(["hvaa_alt_diff", 0.0])
+		hvaa_info.append(["hvaa_angle_off", 0.0])
+		hvaa_info.append(["hvaa_heading", 0.0])
+		hvaa_info.append(["hvaa_detected", 0.0])
+	# --- end HVAA info block ---
 	
 	var tracks_info = []	
 	
@@ -481,7 +635,7 @@ func get_obs(with_labels = false):
 			
 			
 	
-	var obs = own_info + tracks_info + allied_tracks_info
+	var obs = own_info + hvaa_info + tracks_info + allied_tracks_info
 	
 	var obs_values = obs.map(func(item): return item[1])
 	
@@ -546,11 +700,17 @@ func set_action(action):
 		last_desiredG_input = action["input"][2]
 		last_fire_input = action["input"][3]
 			
-		hdg_input = Calc.get_desired_heading(current_hdg, last_hdg_input * 180.0)		
+		var desired_heading_change = last_hdg_input * 180.0  # -180 to +180 degrees
+		hdg_input = Calc.clamp_hdg(current_hdg + desired_heading_change)	
 		level_input = (last_level_input * 25000.0 + 25000.0) * SConv.FT2GDM  	
 		desiredG_input = (last_desiredG_input * (max_g  - 1.0) + (max_g + 1.0))/2.0	
 		shoot_input = 0 if last_fire_input <= 0 else 1
-	
+		#print("Fighter ", id, " received action: raw_hdg=", last_hdg_input, 
+		#" -> hdg_change=", desired_heading_change, 
+		#" current_hdg=", current_hdg, 
+		#" -> new_hdg_input=", hdg_input, 
+		#	" level=", level_input / SConv.FT2GDM)
+		
 	elif action_type == "Low_Level_Discrete":  
 								
 		hdg_input = Calc.get_desired_heading(current_hdg, turn_conv[action["turn_input"]])		
@@ -573,12 +733,34 @@ func process_tracks():
 	var max_offensive = 0.0
 	var new_HPT = null
 	var new_HRT = null
+	
+	var hvaa_track = null
 					
 	for track in radar_track_list:						
 								
 		if track.obj.activated:
 			
 			track.update_track(self, track.obj, current_time)
+						# === ADD DEBUG ===
+			#if track.obj.is_hvaa:
+			#	print("Red ", id, " tracking HVAA ", track.obj.id, 
+			#		  " detected=", track.detected,
+			#		  " dist_nm=", track.dist / SConv.NM2GDM,
+			#		  " aspect=", track.aspect_angle,
+			#		  " v_aspect=", track.vert_aspect_angle)
+			#	if track.detected:
+			#		hvaa_track = track
+			# =================
+			
+			if n_steps < 5:  # Only first few steps
+				_dbg("POST-UPDATE trk " + str(track.id) 
+					+ " dist_nm=" + str(track.dist / SConv.NM2GDM)
+					+ " my_pos=" + str(global_transform.origin)
+					+ " tgt_pos=" + str(track.obj.global_transform.origin))
+			
+			if "is_hvaa" in track.obj and track.obj.is_hvaa:
+				if track.detected:
+					hvaa_track = track
 			
 			track.dl_track = false
 			
@@ -612,7 +794,17 @@ func process_tracks():
 					
 					track.update_wez_data(get_wez_for_track(track))						
 					
-					if track.threat_factor > max_offensive: # and track.obj.get_meta('id') == 1:
+					# DEBUG: WEZ gates and chosen HPT/HRT drivers
+					if n_steps % DBG_THROTTLE_STEPS == 0:
+						_dbg("trk " + str(track.id)
+							+ " OFF=" + str(track.offensive_factor)
+							+ " THR=" + str(track.threat_factor)
+							+ " Rmax_nm≈" + str(track.own_missile_RMax / SConv.NM2GDM)
+							+ " Rnez_nm≈" + str(track.own_missile_Nez / SConv.NM2GDM)
+							+ " invAspect=" + str(track.inv_aspect_angle)
+							+ " angleOff=" + str(track.angle_off))
+					
+					if track.offensive_factor > max_offensive: # and track.obj.get_meta('id') == 1:
 						max_offensive = track.offensive_factor					
 						new_HPT = track
 					
@@ -630,6 +822,13 @@ func process_tracks():
 			track.detected = false
 			manager.team_dl_tracks[team_id][track.id] = false
 												
+	if hvaa_track != null and team_id == 1:
+		if new_HPT == null:
+			new_HPT = hvaa_track
+		elif hvaa_track.detected and hvaa_track.dist < new_HPT.dist * 1.5:
+		# HVAA is detected and reasonably close, switch to it
+			new_HPT = hvaa_track
+				
 	if HPT != null:			
 		if not HPT.is_missile_support or not HPT.is_alive:
 			HPT = new_HPT
@@ -640,6 +839,9 @@ func process_tracks():
 		
 func process_behavior(delta_s):
 			
+	#print("Red ", id, " process_behavior: behavior=", behavior, 
+	#	" tactic_status=", tatic_status, 
+	#	" HPT=", HPT.obj.id if HPT != null else "null")
 	tatic_time += delta_s		
 	
 	if behavior == "duck":			
@@ -682,11 +884,24 @@ func process_behavior(delta_s):
 				
 		if tatic_status != "Evade" and HPT != null and\
 		   HPT.detected and HPT.threat_factor > (lBreak * break_error + 0.5 * int(HPT.is_missile_support)):
-			tatic_time = 0.0					
-			tatic_status = "Evade" 
-			break_error = -1       						
-			hdg_input = Calc.clamp_hdg(HPT.radial + 180.0)
-			desiredG_input = 6.0		
+			#print("Red ", id, " EVADE CHECK: HPT_id=", HPT.obj.id, 
+				#" is_hvaa=", HPT.obj.is_hvaa,
+				#" threat_factor=", HPT.threat_factor,
+				#" lBreak=", lBreak,
+				#" break_error=", break_error,
+				#" threshold=", (lBreak * break_error + 0.5 * int(HPT.is_missile_support)),
+				#" is_missile_support=", HPT.is_missile_support)
+	# =================
+			
+			if not HPT.obj.is_hvaa:
+				tatic_time = 0.0					
+				tatic_status = "Evade" 
+				break_error = -1       						
+				hdg_input = Calc.clamp_hdg(HPT.radial + 180.0)
+				desiredG_input = 6.0		
+				#print("Red ", id, " ENTERING EVADE from target ", HPT.obj.id)
+			#else:
+				#print("Red ", id, " SKIPPING EVADE because target is HVAA")
 
 		elif tatic_status == "Search" or tatic_status == "Return":
 			
@@ -743,7 +958,12 @@ func process_behavior(delta_s):
 																										
 				if HPT.offensive_factor > dShot * shoot_range_error:					
 					#print( id, "(" ,current_time, " ) :", [HPT.offensive_factor, HPT.threat_factor,abs(HPT.aspect_angle)])					
-					if abs(HPT.aspect_angle) < 15.0 and !HPT.is_missile_support:					
+					#if abs(HPT.aspect_angle) < 15.0 and !HPT.is_missile_support:	
+					var aspect_ok = abs(HPT.aspect_angle) < 15.0
+					if HPT.obj.is_hvaa:
+						aspect_ok = abs(HPT.aspect_angle) < 60.0  # Much wider for HVAA
+	
+					if aspect_ok and !HPT.is_missile_support:				
 						if launch_missile_at_target(HPT):							
 							tatic_status = "MissileSupport"			
 							tatic_time = 0.0							
@@ -752,12 +972,13 @@ func process_behavior(delta_s):
 							#print(tatic_status, tatic_time)
 																
 				if HPT.detected and HPT.threat_factor > (lBreak * break_error + 0.5 * int(HPT.is_missile_support)):
-					tatic_time = 0.0					
-					tatic_status = "Evade" 
-					crank_error = -1
-					break_error = -1       										
-					hdg_input = Calc.clamp_hdg(HPT.radial + 180)#fmod(oposite_hdg + 180.0, 360.0) - 180.0
-					desiredG_input = 6.0		
+					if not HPT.obj.is_hvaa:
+						tatic_time = 0.0					
+						tatic_status = "Evade" 
+						crank_error = -1
+						break_error = -1       										
+						hdg_input = Calc.clamp_hdg(HPT.radial + 180)#fmod(oposite_hdg + 180.0, 360.0) - 180.0
+						desiredG_input = 6.0		
 				
 				
 				if mission == "striker":
@@ -791,25 +1012,36 @@ func process_behavior(delta_s):
 				
 				if in_flight_missile.pitbull or in_flight_missile == null:
 				
-					tatic_status = "Evade"        						
-					tatic_time = 0.0		
-														
-					if HPT != null:
-						hdg_input = Calc.clamp_hdg(HPT.radial + 180)						
+					if HPT != null and HPT.obj.is_hvaa:
+						hdg_input = Calc.clamp_hdg(HPT.radial + defense_side * 50.0)
+						desiredG_input = 3.0
+						#print("Red ", id, " continuing to support missile against HVAA")
 					else:
-						hdg_input = Calc.clamp_hdg(current_hdg + 180 - defense_side * 50.0)#fmod(oposite_hdg + 180.0, 360.0) - 180.0							
-					
-					desiredG_input = 6.0													
+						tatic_status = "Evade"        						
+						tatic_time = 0.0		
+															
+						if HPT != null:
+							hdg_input = Calc.clamp_hdg(HPT.radial + 180)						
+						else:
+							hdg_input = Calc.clamp_hdg(current_hdg + 180 - defense_side * 50.0)#fmod(oposite_hdg + 180.0, 360.0) - 180.0							
+						
+						desiredG_input = 6.0		
+						#print("Red ", id, " missile went pitbull, entering Evade")											
 				else:
 					if HPT != null:
 						hdg_input = Calc.clamp_hdg(HPT.radial + defense_side * 50.0) 										
 			else:								
-				tatic_status = "Evade"        
-				AP_mode = "FlyHdg"				
-				tatic_time = 0.0		
-													
-				hdg_input = Calc.clamp_hdg(current_hdg + 180- defense_side * 50.0)#fmod(oposite_hdg + 180.0, 360.0) - 180.0
-				desiredG_input = max_g			
+				if HPT != null and HPT.obj.is_hvaa:
+					tatic_status = "Engage"
+					tatic_time = 0.0
+					#print("Red ", id, " missile lost but target is HVAA, re-engaging")
+				else:
+					tatic_status = "Evade"        
+					AP_mode = "FlyHdg"				
+					tatic_time = 0.0		
+														
+					hdg_input = Calc.clamp_hdg(current_hdg + 180- defense_side * 50.0)#fmod(oposite_hdg + 180.0, 360.0) - 180.0
+					desiredG_input = max_g			
 				#print(tatic_status, tatic_time)
 				
 		elif tatic_status == "Evade" and tatic_time >= 80.0:
@@ -871,6 +1103,10 @@ func get_wez_for_track(track):
 			enemyRMax	= 0.01
 		if enemyRNez <=0: 
 			enemyRNez	= 0.01
+			
+		if track.obj.is_hvaa and team_id == 1:
+			ownRMax = max(ownRMax, 80.0 * SConv.NM2GDM)  # Assume 80nm range to HVAA
+			ownRNez = max(ownRNez, 40.0 * SConv.NM2GDM)  # 40nm NEZ
 	
 	
 													
@@ -888,7 +1124,24 @@ func get_wez_for_track(track):
 		enemyRMax	= 0.01
 	if enemyRNez <=0: 
 		enemyRNez	= 0.01
+		
+	# === ADD DEBUG ===
+	#if track.obj.is_hvaa:
+	#	print("Red ", id, " WEZ for HVAA: ownRMax=", ownRMax / SConv.NM2GDM, "nm",
+	#		" enemyRMax=", enemyRMax / SConv.NM2GDM, "nm (should be tiny)")
+# ===============
+
+	if track.obj.is_hvaa and team_id == 1:
+		ownRMax = max(ownRMax, 80.0 * SConv.NM2GDM)  # Assume 80nm range to HVAA
+		ownRNez = max(ownRNez, 40.0 * SConv.NM2GDM) 
+		# Make HVAA have zero threat
+		enemyRMax = 0.001
+		enemyRNez = 0.001
 	
+	# === ADD DEBUG ===
+	#if track.obj.is_hvaa:
+		#print("Red ", id, " WEZ AFTER fix: enemyRMax=", enemyRMax / SConv.NM2GDM, "nm (should be ~0)")
+# =================
 	return [ownRMax, ownRNez, enemyRMax, enemyRNez]
 
 func _physics_process(delta: float) -> void:
@@ -900,6 +1153,34 @@ func _physics_process(delta: float) -> void:
 	
 	#print(id,"| Level: ", current_level / SConv.FT2GDM, " Pitch: ", current_pitch, " HDG: ", current_hdg)
 	
+		# ---- HVAA: hard lock heading/speed and bypass AP/behavior ----
+	if is_hvaa and const_hdg_enable:
+		# 1) Face the fixed heading (yaw-only, level wings)
+		var yaw := -deg_to_rad(const_hdg_deg)  # sign matches your current_hdg calc
+		transform.basis = Basis(Vector3.UP, yaw)
+		$RenderModel.rotation = Vector3.ZERO  # keep the model level
+
+		# 2) Fix the speed
+		if const_speed_kts > 0.0:
+			current_speed = const_speed_kts * SConv.KNOT2GDM_S
+		else:
+			current_speed = max_speed * altitude_speed_factor(current_level)
+
+		# 3) Move straight along that heading (no Y component)
+		var forward := transform.basis.z.normalized()
+		velocity = forward * current_speed
+
+		set_velocity(velocity)
+		set_up_direction(Vector3.UP)
+		move_and_slide()
+
+		n_steps += 1
+		if n_steps % trail_update_rate == 0 and renderize:
+			update_trail()
+		return
+	# ---- end HVAA block ----
+	
+	
 	if n_steps % action_repeat == 0:
 		
 		dist2go = Calc.distance2D_to_pos(global_transform.origin, target_position)			
@@ -908,15 +1189,44 @@ func _physics_process(delta: float) -> void:
 		if behavior != "external":						
 			process_behavior(delta * (n_steps - last_beh_proc))
 			last_beh_proc = n_steps
-		
-	if  behavior == "external"  and shoot_input > 0 and HPT != null:
-		
-		if abs(HPT.aspect_angle) < 30.0 and !HPT.is_missile_support:
-			if launch_missile_at_target(HPT): 									
-				shoot_input = -1		
+	
+	_calculate_hvaa_proximity_reward()
+	if DBG_ON and team_id == 0 and n_steps % DBG_THROTTLE_STEPS == 0:
+		_dbg("=== REWARDS [F" + str(id) + "] ===")
+		_dbg("  Step reward: " + str(get_reward()))
+	
+	
+	if behavior == "external" and shoot_input > 0 and HPT != null:
+		if behavior == "external" and shoot_input > 0:
+			if HPT == null:
+				_dbg("EXT fire requested but HPT=null (no target selected)")
+			else:
+				if n_steps % DBG_THROTTLE_STEPS == 0:
+					_dbg("EXT fire check: tgt_id=" + str(HPT.id)
+						+ " detected=" + str(HPT.detected)
+						+ " OFF=" + str(HPT.offensive_factor)
+						+ " THR=" + str(HPT.threat_factor)
+						+ " dist_nm≈" + str(HPT.dist / SConv.NM2GDM)
+						+ " aspect=" + str(HPT.aspect_angle)
+						+ " missiles=" + str(missiles))
+		if launch_missile_at_target(HPT):
+			shoot_input = -1
 		else:
 			ownRewards.add_missile_no_fire_rew()
 			
+	
+
+# ---- Constant heading/speed locks (used only for scripted/HVAA, not RL) ----
+	#if (const_hdg_enable or is_hvaa) and behavior != "external":
+	if is_hvaa:
+		hdg_input = Calc.clamp_hdg(const_hdg_deg)
+		AP_mode = "FlyHdg"
+
+	#if (const_speed >= 0.0 or is_hvaa) and behavior != "external":
+	if is_hvaa:
+		var locked_speed = const_speed if const_speed >= 0.0 else (max_speed * altitude_speed_factor(current_level))
+		current_speed = locked_speed
+		velocity = -transform.basis.z.normalized() * current_speed
 	
 	var turn_g = clamp(desiredG_input, 1.0,  max_g * altitude_g_factor(current_level)) * SConv.GRAVITY_GDM
 	var turn_speed =  turn_g / velocity.length() 
@@ -943,44 +1253,142 @@ func _physics_process(delta: float) -> void:
 	# Update the trail
 	if n_steps % trail_update_rate == 0 and renderize:
 		update_trail()
-			
 func process_manouvers_action():
-	
-	#print(_heuristic)
-	if _heuristic == "model":
-		return	
-	#if _heuristic == "human":
-		#turn_input = Input.get_action_strength("roll_left") - Input.get_action_strength("roll_right")
-		#pitch_input = Input.get_action_strength("pitch_up") - Input.get_action_strength("pitch_down")
-	#
-	if _heuristic == "AP":	
-		#
-		if AP_mode == "FlyHdg":
-			#-------- HDG Adjust ----------#
-			# Calculate the heading difference between current and desired								
-			var hdg_diff = Calc.clamp_hdg(hdg_input - current_hdg)	
-			
-			# Adjust turn sensitivity based on the heading difference magnitude					
-			var adjusted_turn_input = hdg_diff / 60.0  
-			turn_input = clamp(adjusted_turn_input, -1.0, 1.0)
-#			
+	# Externally-controlled agents send desired heading/level via set_action().
+	# We still need to translate (hdg_input, level_input) -> (turn_input, pitch_input).
+	if behavior == "external" or behavior == "baseline1" or behavior == "baseline2":
+		#print("Fighter ", id, " (external) converting hdg_input=", hdg_input, " to turn_input")
+		#if AP_mode == "FlyHdg":
+		# -------- HDG Adjust ---------- #
+		var hdg_diff = Calc.clamp_hdg(hdg_input - current_hdg)
+		var adjusted_turn_input = hdg_diff / 60.0
+		turn_input = clamp(adjusted_turn_input, -1.0, 1.0)
+
 		# -------- Level Adjust ---------- #
-		#			
-			#Limit Level Inputs
-			if level_input <= min_level:
-				level_input = min_level
-			elif level_input >= max_level:
-				level_input = max_level
-				
-			var level_diff = level_input - current_level			
-			var adjusted_pitch_input = level_diff 			  
-			
-			var desired_pitch = clamp(adjusted_pitch_input, min_pitch, max_pitch)																	
-			var pitch_diff = desired_pitch - current_pitch						
-			pitch_input = deg_to_rad(pitch_diff)
+		#if level_input <= min_level:
+		#	level_input = min_level
+		#elif level_input >= max_level:
+		#	level_input = max_level
+
+		var level_diff = level_input - current_level
+		var desired_pitch = clamp(level_diff, min_pitch, max_pitch)
+		var pitch_diff = desired_pitch - current_pitch
+		pitch_input = deg_to_rad(pitch_diff)
+	return
 							
 func launch_missile_at_target(target_track):
-		
+		# --- DEBUG FIRE CHECK ---
+	var inv_ok   = missiles > 0
+	var trk_ok   = target_track != null and target_track.detected
+	var rng_ok   = target_track != null and target_track.dist <= radar_range
+	var iff_ok   = (target_track != null and target_track.obj.team_id != team_id)
+	var cool_ok  = not is_instance_valid(in_flight_missile)
+	var asp_ok   = target_track != null and abs(target_track.aspect_angle) < 60.0
+	var fof_ok   = true   # placeholder, if you don’t have a friendly-fire check
+	var gim_ok   = true   # placeholder, if gimbal/FOV logic handled elsewhere
+	var clo_ok   = target_track != null and abs(target_track.vert_aspect_angle) < 90.0
+
+	var Rmin_nm  = 2.0
+	var Rmax_nm  = target_track.own_missile_RMax / SConv.NM2GDM if target_track != null else 0.0
+	var dist_nm  = target_track.dist / SConv.NM2GDM if target_track != null else 0.0
+
+	var raw_OFF  = target_track.offensive_factor if target_track != null else -1.0
+	var THR      = target_track.threat_factor if target_track != null else -1.0
+	var fire_cmd = shoot_input
+	var raw_fire_val = last_fire_input
+
+	_dbg("[FIRECHK] inv=" + str(inv_ok)
+		+ " cool=" + str(cool_ok)
+		+ " trk=" + str(trk_ok)
+		+ " iff=" + str(iff_ok)
+		+ " rng=" + str(rng_ok)
+		+ " asp=" + str(asp_ok)
+		+ " fof=" + str(fof_ok)
+		+ " gim=" + str(gim_ok)
+		+ " clo=" + str(clo_ok)
+		+ " | Rmin=" + str(Rmin_nm)
+		+ " R=" + str(dist_nm)
+		+ " Rmax=" + str(Rmax_nm)
+		+ " OFF=" + str(raw_OFF)
+		+ " THR=" + str(THR)
+		+ " fire_cmd=" + str(fire_cmd)
+		+ " raw_fire_val=" + str(raw_fire_val))
+	# ----------------------------------------
+		# --- OVERRIDE LOGIC (TEMP) ---
+	var can_fire: bool   = (missiles > 0) and (target_track != null)
+	var detected_ok: bool = (target_track != null) and target_track.detected
+	var range_nm: float = (target_track.dist / SConv.NM2GDM) if target_track != null else 1e9
+
+	var override_ok := false
+	if DBG_ALLOW_FORCE_FIRE:
+		override_ok = true
+	elif DBG_FIRE_IGNORE_DETECTION and target_track != null:
+		# "blind" fire allowed within a simple range cap
+		override_ok = (range_nm <= DBG_FIRE_MAX_RANGE_NM)
+
+	# --- ORIGINAL GATE, now with overrides ---
+	if can_fire and (detected_ok or override_ok):
+		# If we’re blind-firing, optionally mark support for this shot
+		if override_ok and not detected_ok and target_track != null:
+			target_track.detected_status(true)  # so support code behaves normally
+
+		#There are already a missile in flight this missile lost support
+		if is_instance_valid(in_flight_missile):
+			if not in_flight_missile.pitbull and in_flight_missile != null:
+				in_flight_missile.lost_support()
+				in_flight_missile.missile_track.is_missile_support = false
+
+		var new_missile = missile.instantiate()
+		manager.add_child(new_missile)
+		new_missile.add_to_group(simGroups.MISSILE)
+		new_missile.global_position = global_position
+
+		new_missile.launch(self, target_track)
+		target_track.is_missile_support = true
+
+		in_flight_missile = new_missile
+
+		missiles -= 1
+		ownRewards.add_missile_fire_rew()
+		manager.inform_state(team_id, "missile")
+		return true
+	else:
+		ownRewards.add_missile_no_fire_rew()
+		if missiles <= 0:
+			_dbg("LAUNCH FAIL: no missiles remaining")
+		elif target_track == null:
+			_dbg("LAUNCH FAIL: target_track is null")
+		elif not detected_ok and not override_ok:
+			_dbg("LAUNCH FAIL: target not detected and no override active")
+		return false
+	
+func _calculate_hvaa_proximity_reward():
+	# Only calculate for blue agents (team_id == 0)
+	if team_id != 0:
+		return
+	
+	# Skip if this agent IS the HVAA
+	if is_hvaa:
+		return
+	
+	# Find the closest HVAA
+	var closest_hvaa = null
+	var min_distance = INF
+	
+	for hvaa in manager.hvaa_assets:
+		if is_instance_valid(hvaa) and hvaa.activated:
+			var distance = global_position.distance_to(hvaa.global_position)
+			if distance < min_distance:
+				min_distance = distance
+				closest_hvaa = hvaa
+	
+	# If we found an HVAA, calculate proximity reward
+	if closest_hvaa != null:
+		var distance_nm = min_distance * SConv.GDM2NM
+		# Optimal range: 10 NM (adjust as needed for your scenario)
+		ownRewards.add_hvaa_proximity_rew(distance_nm, 10.0)
+	
+	'''
 	if missiles > 0 and target_track.detected:
 		
 		#There are already a missile in flight this missile lost support
@@ -1006,8 +1414,14 @@ func launch_missile_at_target(target_track):
 		return true
 	else:
 		ownRewards.add_missile_no_fire_rew()
+		if missiles <= 0:
+			_dbg("LAUNCH FAIL: no missiles remaining")
+		elif target_track == null:
+			_dbg("LAUNCH FAIL: target_track is null")
+		elif not target_track.detected:
+			_dbg("LAUNCH FAIL: target not detected (FOV/radar gate)")
 		return false
-
+'''
 func own_kill():
 	if activated == true:
 		_set_destroyed_visuals()
@@ -1025,7 +1439,7 @@ func own_kill():
 		killed = true	
 		done = true	
 		ownRewards.add_hit_own_rew()		
-		manager.inform_state(team_id, "killed")
+		manager.inform_state(team_id, "killed", self)
 	
 func reactivate():
 	set_process(true)
@@ -1044,6 +1458,7 @@ func reactivate():
 
 	_reset_visuals()
 	_reset_trail_visuals()  # Reset trail visuals
+	_apply_hvaa_overrides()
 	activated = true
 	killed = false
 	done = false
@@ -1094,7 +1509,11 @@ func _reset_visuals():
 				material.albedo_color = color
 								
 	change_mesh_instance_colors(root_node, team_color)
-	$Radar.visible = true
+	var radar := _get_radar_node()
+	if radar:
+		radar.visible = not is_hvaa
+	#$Radar.visible = true
+	
 	
 func inform_missile_miss(_missile):
 	ownRewards.add_missile_miss_rew()					
@@ -1109,19 +1528,24 @@ func update_scale(_factor):
 
 # Recursively traverses the node tree to find MeshInstance nodes and changes their material color.
 func change_mesh_instance_colors(node: Node, new_color: Color) -> void:
-	# Iterate through all children of the current node.
 	for child in node.get_children():
-		# If a child is a MeshInstance, process it.
 		if child is MeshInstance3D:
-			# Assuming the MeshInstance uses a material that can have its color changed (e.g., SpatialMaterial in Godot 3.x, StandardMaterial3D in Godot 4.x).
-			for material_index in range(child.get_surface_override_material_count()):
-				var material = child.get_surface_override_material(material_index)
-				if material:
-					var new_material = material.duplicate()  # Duplicate to avoid changing the original material used elsewhere.
-					if "albedo_color" in new_material:  # Check if the material has the 'albedo_color' property.
-						new_material.albedo_color = new_color						
-					child.set_surface_override_material(material_index, new_material)
-		# If a child is not a MeshInstance but might have children of its own, recursively search its subtree.
+			var surf_count: int = child.get_surface_override_material_count()
+			for i in range(surf_count):
+				var mat: Material = child.get_surface_override_material(i)
+				if mat == null:
+					# fall back to active/built-in material
+					mat = child.get_active_material(i)
+				if mat == null:
+					# final fallback: create a fresh material
+					mat = StandardMaterial3D.new()
+
+				var new_mat := mat.duplicate()
+				if new_mat is BaseMaterial3D:
+					new_mat.albedo_color = new_color
+					child.set_surface_override_material(i, new_mat)
+
+		# recurse
 		change_mesh_instance_colors(child, new_color)
 
 	# Recursively call this function for all children of the current node.
@@ -1205,6 +1629,9 @@ func process_allied_tracks():
 			track.is_alive = false
 	
 func update_trail_obj():
+	
+	if not is_instance_valid(trail_node):
+		return
 	
 	if renderize:
 		if team_id == 0:

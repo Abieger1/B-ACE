@@ -209,7 +209,19 @@ class GodotEnv:
         Returns:
             tuple: Tuple containing observation, reward, done flag, termination flag, and info.
         """
-        response = self._get_json_dict()
+        while True:
+            response = self._get_dict_json_message()
+
+            # Optional but very helpful debug:
+            rtype = response.get("type", None)
+            if "obs" in response:
+                break
+
+            # If it's not the obs payload, keep looping
+            # You can print once to see what is arriving:
+            print(f"[RESET DEBUG] skipping message type={rtype}, keys={list(response.keys())}")
+
+        # Now we *know* obs exists
         response["obs"] = self._process_obs(response["obs"])
 
         # Kept for backward compatibility if the plugin doesn't send info.
@@ -251,8 +263,36 @@ class GodotEnv:
             "type": "reset",
         }
         self._send_as_json(message)
-        response = self._get_json_dict()
-        response["obs"] = self._process_obs(response["obs"])
+        # --- Robust reset receive: Godot may send other messages before reset obs ---
+        max_msgs = 200  # prevents infinite hang if Godot is broken
+        obs_payload = None
+        last = None
+
+        for i in range(max_msgs):
+            response = self._get_dict_json_message()
+            last = response
+
+            # Case 1: normal shape
+            if isinstance(response, dict) and "obs" in response:
+                obs_payload = response["obs"]
+                break
+
+            # Case 2: some Godot code replies with {"type":"call","returns":{...}}
+            if isinstance(response, dict) and isinstance(response.get("returns"), dict) and "obs" in response["returns"]:
+                obs_payload = response["returns"]["obs"]
+                break
+
+            # Helpful one-line debug (keep for now)
+            print(f"[RESET DEBUG] skipping msg {i+1}/{max_msgs}: type={response.get('type')} keys={list(response.keys())}")
+
+        if obs_payload is None:
+            raise RuntimeError(
+                f"Reset failed: never received 'obs' in {max_msgs} messages. "
+                f"Last message type={last.get('type') if isinstance(last, dict) else type(last)} last={last}"
+            )
+
+        # Now safely process obs
+        response["obs"] = self._process_obs(obs_payload)
         assert response["type"] == "reset"
         obs = response["obs"]
         return obs, [{}] * self.num_envs
@@ -313,7 +353,7 @@ class GodotEnv:
             launch_cmd.append("--disable-render-loop")
             launch_cmd.append("--headless")
         if framerate is not None:
-            launch_cmd.append(f"--fixed-fps {framerate}")
+            launch_cmd.append(f"--fixed-fps={framerate}")
         if action_repeat is not None:
             launch_cmd.append(f"--action_repeat={action_repeat}")
         if speedup is not None:
@@ -322,6 +362,8 @@ class GodotEnv:
             for key, value in kwargs.items():
                 launch_cmd.append(f"--{key}={value}")
 
+        print("DEBUG PY: launch_cmd =", launch_cmd)
+        
         self.proc = subprocess.Popen(
             launch_cmd,
             start_new_session=True,
@@ -331,7 +373,7 @@ class GodotEnv:
     def _start_server(self):
         # Either launch a an exported Godot project or connect to a playing godot game
         # connect to playing godot game
-
+        print(f"DEBUG PY: binding 127.0.0.1:{self.port}")
         print(f"waiting for remote GODOT connection on port {self.port}")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -345,6 +387,7 @@ class GodotEnv:
         sock.listen(1)
         sock.settimeout(GodotEnv.DEFAULT_TIMEOUT)
         connection, client_address = sock.accept()
+        print("DEBUG PY: connection established from", client_address)
         # connection.settimeout(GodotEnv.DEFAULT_TIMEOUT)
         #        connection.setblocking(False) TODO
         print("connection established")
@@ -363,9 +406,21 @@ class GodotEnv:
         message = {"type": "env_info"}
         self._send_as_json(message)
 
-        json_dict = self._get_json_dict()
+        while True:
+            json_dict = self._get_json_dict()
+            if json_dict is None:
+                raise RuntimeError("Connection to Godot closed while requesting env_info.")
 
-        assert json_dict["type"] == "env_info"
+            msg_type = json_dict.get("type")
+            if msg_type == "env_info":
+                break
+
+            # Some Godot builds acknowledge config updates before answering env_info.
+            # Ignore those lightweight messages so earlier logic keeps working.
+            if msg_type == "ack":
+                continue
+
+            raise AssertionError(f"Unexpected message type '{msg_type}' while waiting for env_info.")
 
         # Number of AIController instances in a single Godot env/process
         self.num_envs = json_dict["n_agents"]
@@ -446,6 +501,20 @@ class GodotEnv:
     def _get_json_dict(self):
         data = self._get_data()
         return json.loads(data)
+    
+    def _get_dict_json_message(self):
+
+    #Blocking read of a single length-prefixed JSON message from Godot.
+    #Returns it as a Python dict.
+
+        data = self._get_data()
+        if data is None:
+            raise RuntimeError("Lost connection to Godot while waiting for message.")
+        try:
+            msg = json.loads(data)
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse JSON from Godot: {data}") from e
+        return msg
 
     def _get_obs(self):
         return self._get_data()

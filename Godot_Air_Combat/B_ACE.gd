@@ -1,3 +1,5 @@
+#Should be OLD CODE
+
 extends Control
 
 var goals = []
@@ -15,7 +17,7 @@ var mouse_sens = 0.1
 var camera_angle_v = 0
 var camera_angle_h = 0
 
-var zoom_level = 10
+var zoom_level = 100
 var move_speed = 5
 
 @onready var canvas = get_node("CanvasLayer")
@@ -28,5 +30,13 @@ func _ready():
 	
 	cameraGlobal = get_node("CameraGlobal")
 	cameraGlobal.make_current()
+	
+		# ADD THESE LINES:
+	cameraGlobal.position = Vector3(0, 500, 400)  # Zoom out
+	cameraGlobal.fov = 100                         # Wide angle
+	cameraGlobal.rotation_degrees.x = -40          # Look down
+	
+	
 	self.position.y = zoom_level
-	RenderingServer.render_loop_enabled = false
+	RenderingServer.render_loop_enabled = true
+	

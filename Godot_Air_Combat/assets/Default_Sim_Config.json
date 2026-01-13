@@ -23,14 +23,14 @@
 			"keep_track_factor": 0.001,
 			"hit_enemy_factor": 3.0,
 			"hit_own_factor": -5.0,			
-			"mission_accomplished_factor": 10.0,			
+			"mission_accomplished_factor": 10.0			
 		}
 	},
 
 	"AgentsConfig" : 
 	{
 		"blue_agents": { 
-			"num_agents" : 4,
+			"num_agents" : 2,
 			"share_states" : 1,
 			"share_tracks" : 1,	
 			"base_behavior": "baseline1",
@@ -53,7 +53,7 @@
 		},	
 		"red_agents":
 		{ 
-			"num_agents" : 4, 
+			"num_agents" : 2, 
 			"share_states" : 1,	
 			"share_tracks" : 1,		
 			"base_behavior": "baseline1",
@@ -72,7 +72,24 @@
 			"rnd_crank_var": 0.025,
 			"rnd_break_var": 0.025,
 			"wez_models" : "res://assets/wez/Default_Wez_params.json"
-		}
-	},
+		},
+		"hvaa_agents": {
+			"num_agents": 1,
+			"base_behavior": "external",
+			"mission": "DCA",
+			"init_position": {"x": 25.0, "y": 25000.0, "z": 40.0},
+			"offset_pos": {"x": 0.0, "y": 0.0, "z": 0.0},
+			"init_hdg": 135.0,
+			"target_position": {"x": 100.0, "y": 25000.0, "z": 80.0},
+			"rnd_offset_range": {"x": 0.0, "y": 0.0, "z": 0.0},
+			"wez_models": "res://assets/wez/Default_Wez_params.json",
+
+			"is_hvaa": true,
+			"missiles": 0,
+			"const_hdg_enable": true,
+			"const_hdg_deg": 135.0,
+			"const_speed": 300.0
+			}
+	}
 	
 }

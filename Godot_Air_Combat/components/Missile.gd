@@ -1,3 +1,4 @@
+
 extends CharacterBody3D
 
 const SConv = preload("res://assets/Sim_assets.gd").SConv
@@ -10,9 +11,9 @@ var ref_speed: float
 
 var turn_speed: float = 2.0
 
-var last_know_target
-var last_know_velocity	
-var direction_to_target
+var last_know_target: Vector3 = Vector3.ZERO
+var last_know_velocity: Vector3 = Vector3.ZERO
+var direction_to_target: Vector3 = Vector3.ZERO
 # var current_velocity # No longer needed, can use velocity.normalized() directly
 
 var n_steps = 0
@@ -42,7 +43,10 @@ func launch(_shooter, _target_track):
 	
 	get_node("RenderModel").set_scale(_shooter.get_node("RenderModel").get_scale()/2)
 	
+	#last_know_target = _target_track.obj.global_transform.origin
 	last_know_target = _target_track.obj.global_transform.origin
+	last_know_velocity = _target_track.obj.velocity 
+	
 	
 	var shooter_linear_velocity = shooter.velocity
 	
@@ -68,6 +72,17 @@ func launch(_shooter, _target_track):
 
 func _physics_process(delta: float) -> void:
 	time_of_fligth += delta
+	
+	# Check if target still exists and is valid
+	if not is_instance_valid(target):
+		queue_free()
+		return
+	
+	# Additional check: if target is a Fighter, verify it's still active
+	if target.has_method("is_type") and target.is_type("Fighter"):
+		if target.killed or not target.activated:
+			queue_free()
+			return
 	
 	if target:
 		if pitbull or upLink_support:
@@ -108,7 +123,7 @@ func _physics_process(delta: float) -> void:
 # Note: Your collision detection using an Area3D will continue to work perfectly.
 # The _on_area_3d_body_entered function does not need to change at all.
 func _on_area_3d_body_entered(body):
-	if body.is_type("Fighter") and body != shooter:
+	if body.has_method("is_type") and body.is_type("Fighter") and body != shooter:
 		if body.activated:
 			body.own_kill()
 			shooter.ownRewards.add_hit_enemy_rew()
