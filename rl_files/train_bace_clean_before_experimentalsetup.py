@@ -73,7 +73,7 @@ from b_ace_py.enriched_observation_wrapper import EnrichedObservationWrapper
 from expert_alignment_wrapper import ExpertAlignmentWrapper, create_alignment_decay_fn, get_default_enriched_obs_indices
 from sustained_turn_penalty import SustainedTurnPenaltySimple
 from hvaa_destruction_penalty import HVAADestructionPenalty
-from rollback_eval_callback import RollbackEvaluationCallbackTopK as RollbackEvaluationCallback
+from rollback_eval_callback import RollbackEvaluationCallback
 # from b_ace_py.reward_shaping_wrapper import RewardShapingWrapper, RewardShapingConfig  # DISABLED (no reward shaping wrapper)
 try:
     from reward_component_eval_callback import RewardComponentEvalCallback
@@ -1466,24 +1466,7 @@ def _parse_args():
         "--use-enriched-obs",
         action="store_true",
         default=False,
-        help="Enable enriched observations with pursuit-evasion heuristics"
-    )
-    parser.add_argument(
-        "--ablation-config",
-        type=str,
-        default="all",
-        choices=['all', 'none', 'geometry_only', 'engagement_only', 'range_limited_only',
-                 'geometry_engagement', 'geometry_range', 'engagement_range'],
-        help="""Ablation config for feature categories (only applies when --use-enriched-obs is set):
-  all                 = A+B+C (GEOMETRY + ENGAGEMENT + RANGE_LIMITED)
-  none                = No theoretical features (raw obs only)
-  geometry_only       = A only (Apollonius + ATDDG)
-  engagement_only     = B only (BEZ + DMC + WEZ)
-  range_limited_only  = C only (Critical escape + capture probability)
-  geometry_engagement = A+B (GEOMETRY + ENGAGEMENT)
-  geometry_range      = A+C (GEOMETRY + RANGE_LIMITED)
-  engagement_range    = B+C (ENGAGEMENT + RANGE_LIMITED)
-"""
+        help="Enable enriched observations with pursuit-evasion heuristics (47 dims)"
     )
     #parser.add_argument(
     #    "--no-enriched-obs",
@@ -1495,7 +1478,7 @@ def _parse_args():
     parser.add_argument("--alignment-coef", type=float, default=0.1)
     parser.add_argument("--alignment-decay-start", type=int, default=500_000)
     parser.add_argument("--alignment-decay-end", type=int, default=2_000_000)
-    # Set default to False (baseline observations by default)
+    # Set default to True (enriched observations enabled by default)
     parser.set_defaults(use_enriched_obs=False)
     
     return parser.parse_args()
@@ -1759,26 +1742,8 @@ def main():
 
             # === ENRICHED OBSERVATIONS (OPTIONAL) ===
             if args.use_enriched_obs:
-                # Map ablation config to human-readable category names
-                config_to_categories = {
-                    'all': 'A+B+C (all features)',
-                    'none': 'No features (enriched wrapper active but 0 features)',
-                    'geometry_only': 'A only (GEOMETRY)',
-                    'engagement_only': 'B only (ENGAGEMENT)',
-                    'range_limited_only': 'C only (RANGE_LIMITED)',
-                    'geometry_engagement': 'A+B (GEOMETRY + ENGAGEMENT)',
-                    'geometry_range': 'A+C (GEOMETRY + RANGE_LIMITED)',
-                    'engagement_range': 'B+C (ENGAGEMENT + RANGE_LIMITED)',
-                }
-                
                 print("\n" + "="*60)
                 print("USING ENRICHED OBSERVATIONS")
-                print(f"  Ablation Config: {args.ablation_config}")
-                print(f"  Categories: {config_to_categories.get(args.ablation_config, 'unknown')}")
-                print("  Legend:")
-                print("    [A] GEOMETRY     = Apollonius circle + ATDDG (Weintraub 2020)")
-                print("    [B] ENGAGEMENT   = BEZ + DMC + WEZ (Von Moll 2024)")
-                print("    [C] RANGE_LIMITED = Escape heading + capture prob (Weintraub 2023)")
                 print("="*60 + "\n")
                 
                 e = EnrichedObservationWrapper(
@@ -1790,8 +1755,15 @@ def main():
                         'capture_radius': 0.01,
                         'pursuer_range': 0.5,
                         'normalize_distance': 1.0,
+                        'enable_apollonius': True,
+                        'enable_bez': True,
+                        'enable_dmc': True,
+                        'enable_multi_threat': False,
+                        'enable_hvaa_escort': False,
+                        'enable_offense_wez': True,
+                        'enable_offense_ttc': True,
+                        'enable_reward_shaping': False,
                     },
-                    ablation_config=args.ablation_config,
                     debug=False
                 )
             else:
@@ -2017,8 +1989,8 @@ def main():
         eval_freq=200000,
         n_eval_episodes=15,
         log_dir=log_dir,
-        rollback_patience=5,      # Rollback after 3 declines
-        lr_decay_factor=0.7,      
+        rollback_patience=3,      # Rollback after 3 declines
+        lr_decay_factor=0.3,      
         activation_threshold=12.0,  # Only activate rollback after reaching 15.0 or better
         min_lr=1e-6,
         max_rollbacks=10,

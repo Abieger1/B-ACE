@@ -11,42 +11,68 @@ python rl_files/run_optuna_parallel.py \
 ## FINAL STATISTIC TESTING:
 
 python rl_files/evaluate_single_model_multi_seed.py \
-    --model-path runs_sb3/config0_v2/config0_v2_seed42_20260108_223909/best_model.zip \
-    --eval-seeds 64 128 168 \
-    --episodes 300 \
+    --model-path runs_sb3/baseline_experiment_v3/baseline_experiment_v3_seed42_20260115_122150/best_checkpoint/best_model.zip  \
+    --vecnormalize-path runs_sb3/baseline_experiment_v3/baseline_experiment_v3_seed42_20260115_122150/best_checkpoint/best_vecnormalize.pkl \
+    --eval-seeds 64 \
+    --episodes 100 \
     --renderize 1
 
 
-#Test Curriculum Training Run
-python rl_files/train_bace_clean_curriculum.py \
-  --seed 42 \
-  --total-timesteps 400_000 \
-  --experiment-name config0_v5 
+# EXPERIMENTAL RUN WITH SEEDS
+python rl_files/run_experiment.py \
+    --experiment-name experiment_ABC \
+    --total-timesteps 10_000_000 \
+    --seeds 42 \
+    --log-to-file
+
 
 #CONFIG 1 - Clean PPO Training
 python rl_files/train_bace_clean.py \
+  --experiment-name baseline_experiment_v2 \
   --seed 42 \
-  --total-timesteps 10_000_000 \
-  --experiment-name config0_v5 \
-  --use_enriched_obs \
+  --total-timesteps 10000000
+  --use-enriched-obs \
+  --ablation-config all \
   --expert_alignment
 
 
-#CORRECT PLOTTING
-python rl_files/plot_eval_learning_curves.py \
-    --experiment-dir runs_sb3/config0_v3 \
-    --output-file config0_v3_LearningCurve.png \
-    --title "Configuration 0: Baseline PPO" \
+#PLOTTING SECTION - Seed 456, 789, 1011
+
+python rl_files/plot_eval_learning_curve_updated.py \
+    --experiment-dir runs_sb3/baseline_experiment_v3 \
+    --output-file baseline_experiment_v3_LearningCurve_seed456.png \
+    --title "Baseline Seed 456" \
     --hyperparams "initial lr=2.5e-4, final lr=3.5e-5, initial ent=4.5e-2, final ent=2.5e-2, GAE lam=0.911, clip range=0.2, vf coef=0.77"
 
-python rl_files/evaluate_best_model_300.py \
-  --model-path runs_sb3/config0_baseline/config0_baseline_seed42_20260108_155218/best_model.zip \
-  --renderize 1 \
-  --episodes 300
+# Plot only seed123
+python rl_files/plot_eval_learning_curve_updated.py \
+    --experiment-dir runs_sb3/baseline_experiment_v2 \
+    --output-file baseline_seed42.png \
+    --seeds seed42 \
+    --title "ABC 42"
 
-python rl_files/evaluate_best_model_300.py \
-  --model-path runs_sb3/config3_v1/config3_v1_seed42_20260107_103814/best_model.zip \
-  --episodes 300
+# Plot multiple specific seeds
+python rl_files/plot_eval_learning_curve_updated.py \
+    --experiment-dir runs_sb3/baseline_experiment_v2/ \
+    --output-file baseline_seeds_423.png \
+    --seeds seed42 \
+    --title "Baseline Seeds 42 & 123"
+
+# Plot all seeds (default behavior, unchanged)
+python rl_files/plot_eval_learning_curve_updated.py \
+    --experiment-dir runs_sb3/baseline_experiment_v3/ \
+    --output-file baseline_all_seeds.png \
+    --title "Baseline All Seeds"
+
+#PLOT AVERAGE AMONG SSEEDS
+python rl_files/plot_multiseed_learning_curve.py \
+    --experiment-dir runs_sb3/baseline_experiment_v1 \
+    --output-file baseline_mean_5seeds.png \
+    --title "Baseline (5 Seeds)"
+
+
+
+
 
 python rl_files/plot_eval_json.py \
     --json eval_300eps_20260102_104944.json \

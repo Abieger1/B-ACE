@@ -33,7 +33,7 @@
          "inner_radius": 0.0,                
          "altitude": { "value": 25000.0 },   
          "min_sep": 4.0,                     
-         "heading_deg_range": [165.0, 175.0],
+         "heading_deg_range": [350.0, 355.0],
          "speed_range_mps": [220.0, 260.0],
          "respect_bounds": true},
       "HVAASpawn": {
@@ -45,7 +45,7 @@
             "zmax": 49.0
          },
          "altitude": { "value": 25000.0 },
-         "heading_deg_range": [160.0, 170.0],
+         "heading_deg_range": [160.0, 175.0],
          "speed_range_mps": [270.0, 270.0],
          "respect_bounds": true
   }

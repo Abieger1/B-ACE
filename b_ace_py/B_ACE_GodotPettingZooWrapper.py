@@ -276,6 +276,7 @@ class B_ACE_GodotPettingZooWrapper(GodotEnv, ParallelEnv):
         elif not isinstance(info, dict):
             info = {agent_name: {} for agent_name in self.agents}
 
+        ''' Slightly wrong output during evaluations. FIX 15JAN 1600 ==================================
         # --- OPTION A termination gating: define episode_over ALWAYS ---
         episode_over = any(
             bool(info.get(a, {}).get("episode_over", False))
@@ -298,6 +299,26 @@ class B_ACE_GodotPettingZooWrapper(GodotEnv, ParallelEnv):
             for a in self.possible_agents:
                 dones[a] = True
                 truncs[a] = False
+        '''
+        # --- TERMINATION LOGIC: Use episode_over OR original dones ---
+        episode_over_from_info = any(
+            bool(info.get(a, {}).get("episode_over", False))
+            for a in self.possible_agents
+        )
+
+        # Check if any agent is done/truncated from Godot's original signal
+        # Keep these variable names for the diagnostic print statement
+        _any_done = any(bool(dones.get(a, False)) for a in self.possible_agents)
+        _any_trunc = any(bool(truncs.get(a, False)) for a in self.possible_agents)
+
+        # Episode ends if EITHER condition is true
+        _episode_end = episode_over_from_info or _any_done or _any_trunc
+
+        # Set final termination flags based on combined condition
+        for a in self.possible_agents:
+            dones[a] = _episode_end
+            truncs[a] = False  # Use dones for termination, not truncation
+
 
         # --- Derive a per-step 'missile_fired' flag for each agent ---
         for agent_name in self.possible_agents:
