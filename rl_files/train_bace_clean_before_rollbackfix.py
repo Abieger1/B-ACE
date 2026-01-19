@@ -73,7 +73,7 @@ from b_ace_py.enriched_observation_wrapper import EnrichedObservationWrapper
 from expert_alignment_wrapper import ExpertAlignmentWrapper, create_alignment_decay_fn, get_default_enriched_obs_indices
 from sustained_turn_penalty import SustainedTurnPenaltySimple
 from hvaa_destruction_penalty import HVAADestructionPenalty
-from rollback_eval_callback import RollbackEvaluationCallback
+from rollback_eval_callback import RollbackEvaluationCallbackTopK as RollbackEvaluationCallback
 # from b_ace_py.reward_shaping_wrapper import RewardShapingWrapper, RewardShapingConfig  # DISABLED (no reward shaping wrapper)
 try:
     from reward_component_eval_callback import RewardComponentEvalCallback
@@ -118,6 +118,29 @@ class HVAASurvivalEveryNStepsBonus(gym.Wrapper):
 
         self._t += 1
         return obs, rew, terminated, truncated, info
+
+class KillRewardWrapper(gym.Wrapper):
+    """Add reward when red_killed_event FIRST becomes True."""
+    def __init__(self, env, kill_reward: float = 10.0):
+        super().__init__(env)
+        self.kill_reward = kill_reward
+        self._already_awarded = False  # Track if we already gave the reward
+    
+    def reset(self, **kwargs):
+        self._already_awarded = False  # Reset on new episode
+        return self.env.reset(**kwargs)
+    
+    def step(self, action):
+        obs, reward, term, trunc, info = self.env.step(action)
+        
+        # Only award ONCE per episode when red_killed_event first becomes True
+        if info.get("red_killed_event", False) and not self._already_awarded:
+            reward += self.kill_reward
+            self._already_awarded = True
+            print(f"[KILL REWARD] +{self.kill_reward} for killing red!")
+        
+        return obs, reward, term, trunc, info
+
 
 class ActionSmoothnessPenalty(gym.Wrapper):
     """
@@ -832,6 +855,14 @@ class MetricsCollectionCallback(BaseCallback):
         self.recent_rewards = []
 
     def _on_step(self) -> bool:
+        # ---- 0) UPDATE GLOBAL STEP FOR SCHEDULED WRAPPERS ----
+        # This is CRITICAL for FireCooldownWrapper, ActionSmoothnessPenalty, etc.
+        # Without this, _global_step stays at 0 and schedules don't progress!
+        try:
+            self.model.get_env().env_method("set_global_step", int(self.num_timesteps))
+        except Exception:
+            pass  # Silently ignore if method doesn't exist
+        
         # ---- 1) Update schedules every step ----
         # progress_remaining is used by SB3 schedules (1 -> 0)
         progress_remaining = 1.0 - (self.num_timesteps / self.model._total_timesteps)
@@ -977,6 +1008,7 @@ class EvaluationBasedCheckpointCallback(BaseCallback):
         log_dir: Path = None,
         verbose: int = 1,
         deterministic: bool = True,
+        skip_initial_eval: bool = False,
     ):
         super().__init__(verbose)
         self.eval_env = eval_env
@@ -984,6 +1016,7 @@ class EvaluationBasedCheckpointCallback(BaseCallback):
         self.n_eval_episodes = n_eval_episodes
         self.log_dir = Path(log_dir) if log_dir else Path(".")
         self.deterministic = deterministic
+        self.skip_initial_eval = skip_initial_eval
         
         # Best model tracking
         self.best_mean_reward = -np.inf
@@ -1072,6 +1105,13 @@ class EvaluationBasedCheckpointCallback(BaseCallback):
         """
         Run an initial evaluation at timestep 0 so the learning curve starts at 0.
         """
+        if self.skip_initial_eval:
+            if self.verbose > 0:
+                print(f"\n{'='*60}")
+                print(f"⏭️  SKIPPING INITIAL EVALUATION (skip_initial_eval=True)")
+                print(f"{'='*60}\n")
+            return
+        
         if self.verbose > 0:
             print(f"\n{'='*60}")
             print(f"🔍 INITIAL EVALUATION at 0 steps")
@@ -1316,13 +1356,13 @@ def _parse_args():
     parser.add_argument(
         "--initial-entropy-coef",
         type=float,
-        default=0.0299432285194669,
+        default=0.0450525,
         help="Initial entropy coefficient."
     )
     parser.add_argument(
         "--final-entropy-coef",
         type=float,
-        default=0.000039,
+        default=0.0254,
         help="Final entropy coefficient after decay."
     )
     
@@ -1390,7 +1430,7 @@ def _parse_args():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=9,
+        default=8,
         help="Number of epochs per PPO update."
     )
     parser.add_argument(
@@ -1426,7 +1466,24 @@ def _parse_args():
         "--use-enriched-obs",
         action="store_true",
         default=False,
-        help="Enable enriched observations with pursuit-evasion heuristics (47 dims)"
+        help="Enable enriched observations with pursuit-evasion heuristics"
+    )
+    parser.add_argument(
+        "--ablation-config",
+        type=str,
+        default="all",
+        choices=['all', 'none', 'geometry_only', 'engagement_only', 'range_limited_only',
+                 'geometry_engagement', 'geometry_range', 'engagement_range'],
+        help="""Ablation config for feature categories (only applies when --use-enriched-obs is set):
+  all                 = A+B+C (GEOMETRY + ENGAGEMENT + RANGE_LIMITED)
+  none                = No theoretical features (raw obs only)
+  geometry_only       = A only (Apollonius + ATDDG)
+  engagement_only     = B only (BEZ + DMC + WEZ)
+  range_limited_only  = C only (Critical escape + capture probability)
+  geometry_engagement = A+B (GEOMETRY + ENGAGEMENT)
+  geometry_range      = A+C (GEOMETRY + RANGE_LIMITED)
+  engagement_range    = B+C (ENGAGEMENT + RANGE_LIMITED)
+"""
     )
     #parser.add_argument(
     #    "--no-enriched-obs",
@@ -1438,7 +1495,7 @@ def _parse_args():
     parser.add_argument("--alignment-coef", type=float, default=0.1)
     parser.add_argument("--alignment-decay-start", type=int, default=500_000)
     parser.add_argument("--alignment-decay-end", type=int, default=2_000_000)
-    # Set default to True (enriched observations enabled by default)
+    # Set default to False (baseline observations by default)
     parser.set_defaults(use_enriched_obs=False)
     
     return parser.parse_args()
@@ -1702,8 +1759,26 @@ def main():
 
             # === ENRICHED OBSERVATIONS (OPTIONAL) ===
             if args.use_enriched_obs:
+                # Map ablation config to human-readable category names
+                config_to_categories = {
+                    'all': 'A+B+C (all features)',
+                    'none': 'No features (enriched wrapper active but 0 features)',
+                    'geometry_only': 'A only (GEOMETRY)',
+                    'engagement_only': 'B only (ENGAGEMENT)',
+                    'range_limited_only': 'C only (RANGE_LIMITED)',
+                    'geometry_engagement': 'A+B (GEOMETRY + ENGAGEMENT)',
+                    'geometry_range': 'A+C (GEOMETRY + RANGE_LIMITED)',
+                    'engagement_range': 'B+C (ENGAGEMENT + RANGE_LIMITED)',
+                }
+                
                 print("\n" + "="*60)
                 print("USING ENRICHED OBSERVATIONS")
+                print(f"  Ablation Config: {args.ablation_config}")
+                print(f"  Categories: {config_to_categories.get(args.ablation_config, 'unknown')}")
+                print("  Legend:")
+                print("    [A] GEOMETRY     = Apollonius circle + ATDDG (Weintraub 2020)")
+                print("    [B] ENGAGEMENT   = BEZ + DMC + WEZ (Von Moll 2024)")
+                print("    [C] RANGE_LIMITED = Escape heading + capture prob (Weintraub 2023)")
                 print("="*60 + "\n")
                 
                 e = EnrichedObservationWrapper(
@@ -1715,15 +1790,8 @@ def main():
                         'capture_radius': 0.01,
                         'pursuer_range': 0.5,
                         'normalize_distance': 1.0,
-                        'enable_apollonius': True,
-                        'enable_bez': True,
-                        'enable_dmc': True,
-                        'enable_multi_threat': False,
-                        'enable_hvaa_escort': False,
-                        'enable_offense_wez': True,
-                        'enable_offense_ttc': True,
-                        'enable_reward_shaping': False,
                     },
+                    ablation_config=args.ablation_config,
                     debug=False
                 )
             else:
@@ -1733,6 +1801,8 @@ def main():
 
             # === SHAPING WRAPPERS (ALWAYS APPLIED) ===
             e = HeadingRateLimitWrapper(e, hdg_idx=0, max_delta=0.15)
+
+            e = KillRewardWrapper(e, kill_reward=8.0)
 
             e = ActionSmoothnessPenalty(
                 e,
@@ -1751,20 +1821,22 @@ def main():
                 penalty_coef=0.01,  # increase if still spinning
             )
             
-            e = RangeClosingShaping(e, range_idx=17, track_idx=26, k=0.05, clip_delta=0.03)
+            e = RangeClosingShaping(e, range_idx=17, track_idx=26, k=0.2, clip_delta=0.03)
             
             e = FireCooldownWrapper(
                 e,
                 fire_idx=3,
-                cd_start=20,
-                cd_end=300,
-                cd_hold=300_000,
+                cd_start=55,
+                cd_end=120,
+                cd_hold=10_000,
                 cd_steps=5_000_000,
                 rising_edge_after=1_500_000
             )
             
-            e = HVAASurvivalEveryNStepsBonus(e, every_n_steps=50, bonus=0.05)
-            e = HVAADestructionPenalty(e, penalty=-15.0)
+            e = HVAASurvivalEveryNStepsBonus(e, every_n_steps=50, bonus=0.03)
+            # DISABLED: Large instant penalty creates high variance and credit assignment issues
+            # The survival bonus provides dense positive signal instead
+            # e = HVAADestructionPenalty(e, penalty=-15.0)
 
             # === EXPERT ALIGNMENT (ONLY WITH ENRICHED OBS) ===
             if args.expert_alignment:
@@ -1889,7 +1961,7 @@ def main():
         ent_coef=args.initial_entropy_coef,  # Start with initial value (float)
         vf_coef=args.vf_coef,
         max_grad_norm=0.5,
-        target_kl=0.02,
+        target_kl=0.05,
         verbose=1,
         tensorboard_log=log_dir.as_posix(),
         device=args.device,
@@ -1945,11 +2017,12 @@ def main():
         eval_freq=200000,
         n_eval_episodes=15,
         log_dir=log_dir,
-        rollback_patience=3,      # Rollback after 3 declines
-        lr_decay_factor=0.3,      
-        activation_threshold=15.0, 
+        rollback_patience=5,      # Rollback after 3 declines
+        lr_decay_factor=0.7,      
+        activation_threshold=12.0,  # Only activate rollback after reaching 15.0 or better
         min_lr=1e-6,
         max_rollbacks=10,
+        skip_initial_eval=True,   # Skip evaluation at timestep 0
         verbose=1,
         deterministic=True,
     )

@@ -8,7 +8,7 @@ python rl_files/run_optuna_parallel.py \
     --n-trials 300
 
 
-## FINAL STATISTIC TESTING:
+## FINAL STATISTIC TESTING/EVALUATION:
 
 python rl_files/evaluate_single_model_multi_seed.py \
     --model-path runs_sb3/baseline_experiment_v3/baseline_experiment_v3_seed42_20260115_122150/best_checkpoint/best_model.zip  \
@@ -18,7 +18,7 @@ python rl_files/evaluate_single_model_multi_seed.py \
     --renderize 1
 
 
-# EXPERIMENTAL RUN WITH SEEDS
+# EXPERIMENTAL RUN WITH SEEDS 42, 125, 456, 789, 1011
 python rl_files/run_experiment.py \
     --experiment-name experiment_ABC \
     --total-timesteps 10_000_000 \
@@ -28,33 +28,33 @@ python rl_files/run_experiment.py \
 
 #CONFIG 1 - Clean PPO Training
 python rl_files/train_bace_clean.py \
-  --experiment-name baseline_experiment_v2 \
-  --seed 42 \
+  --experiment-name baseline_experiment_v8 \
+  --seed 123, 456, 789, 1011 \
   --total-timesteps 10000000
   --use-enriched-obs \
   --ablation-config all \
   --expert_alignment
 
 
-#PLOTTING SECTION - Seed 456, 789, 1011
+#PLOTTING SECTION - Seed 125, 456, 789, 1011
 
 python rl_files/plot_eval_learning_curve_updated.py \
-    --experiment-dir runs_sb3/baseline_experiment_v3 \
-    --output-file baseline_experiment_v3_LearningCurve_seed456.png \
-    --title "Baseline Seed 456" \
+    --experiment-dir runs_sb3/baseline_experiment_v4 \
+    --output-file baseline_experiment_v4_LearningCurve_seed42.png \
+    --title "Baseline Seed 42" \
     --hyperparams "initial lr=2.5e-4, final lr=3.5e-5, initial ent=4.5e-2, final ent=2.5e-2, GAE lam=0.911, clip range=0.2, vf coef=0.77"
 
 # Plot only seed123
 python rl_files/plot_eval_learning_curve_updated.py \
-    --experiment-dir runs_sb3/baseline_experiment_v2 \
-    --output-file baseline_seed42.png \
+    --experiment-dir runs_sb3/baseline_experiment_v9 \
+    --output-file baseline_v9_seed42.png \
     --seeds seed42 \
-    --title "ABC 42"
+    --title "Test -High decay to low Entropy Coeff with closing reward improved"
 
 # Plot multiple specific seeds
 python rl_files/plot_eval_learning_curve_updated.py \
-    --experiment-dir runs_sb3/baseline_experiment_v2/ \
-    --output-file baseline_seeds_423.png \
+    --experiment-dir runs_sb3/baseline_experiment_v6/ \
+    --output-file baseline_seeds_42_v6.png \
     --seeds seed42 \
     --title "Baseline Seeds 42 & 123"
 

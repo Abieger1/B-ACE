@@ -259,6 +259,15 @@ class B_ACE_GodotPettingZooWrapper(GodotEnv, ParallelEnv):
             print("GodotPZWrapper::Error:: Unknown Actions Type -> ", self.action_type)
 
         obs, reward, dones, truncs, info = super().step(godot_actions, order_ij=order_ij)
+
+        # === DEBUG: RAW FROM GODOT Termination Tracking===
+        #if any(dones.values()) or any(truncs.values()):
+        #    print(f"[GODOT-RAW] step={self._ep_step} dones={dones} truncs={truncs}")
+        #for a in self.possible_agents:
+        #    ai = info.get(a, {}) if isinstance(info, dict) else {}
+        #    if ai.get("episode_over") or ai.get("termination_reason"):
+        #        print(f"[GODOT-INFO] {a}: episode_over={ai.get('episode_over')}, reason={ai.get('termination_reason')}")
+        # === END DEBUG ===
         
         # DEBUG ==================================
        # Count agent-steps (ParallelEnv step)
@@ -341,7 +350,7 @@ class B_ACE_GodotPettingZooWrapper(GodotEnv, ParallelEnv):
         # On first episode end, print a compact reason line
         if _episode_end and not self._printed_ep_end:
             self._printed_ep_end = True
-
+            #print(f"[TERM-DEBUG] At EP-END: self.terminations will be set from dones={dones}")
             # Try to pull a sim clock if Godot passes one
             sim_time = None
             for a in self.possible_agents:
@@ -363,19 +372,32 @@ class B_ACE_GodotPettingZooWrapper(GodotEnv, ParallelEnv):
         # Process observations
         self.observations = {agent_name : {"obs": _obs["obs"], "mask": [True for _ in range(4)]} for agent_name, _obs in obs.items()}
         
+        # === DEBUG: What does dones look like right before aggregation? === termination signal
+        #if _episode_end:
+        #    print(f"[DEBUG-DONES] agents={self.possible_agents}, dones={dones}")
+        # === END DEBUG ===
+
         # Aggregate termination/truncation flags
-        self.terminations = False
+        self.terminations = _episode_end
         self.truncations = False        
         self.rewards = 0.0
         
         for i, agent in enumerate(self.possible_agents):
-            self.terminations = self.terminations or dones[agent]
-            self.truncations = self.truncations and truncs[agent]           
             self.rewards += reward[agent]
+        
+        # Causing termination signal loss 
+        #for i, agent in enumerate(self.possible_agents):
+        #    self.terminations = self.terminations or dones[agent]
+        #    self.truncations = self.truncations or truncs[agent]           
+        #    self.rewards += reward[agent]
+        
+        # === SIMPLER DEBUG: Print whenever _episode_end is True === termination signal
+        if _episode_end:
+            print(f"[TERM-CHECK] _episode_end={_episode_end} → self.terminations={self.terminations}, self.truncations={self.truncations}")
+        # === END DEBUG ===
         
        
         self.info = info
-            
         return self.observations, self.rewards, self.terminations, self.truncations, self.info
 
 

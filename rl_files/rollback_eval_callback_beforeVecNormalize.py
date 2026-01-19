@@ -1,28 +1,29 @@
 """
-rollback_eval_callback_v5.py
+rollback_eval_callback_topk.py
 
 Enhanced Rollback Callback with Top-K Checkpoint Management
 
-ENHANCEMENTS (v5 - NEW):
-- PERMANENT VECNORMALIZE FREEZE: When enabled, VecNormalize stays frozen after rollback
-  until a NEW BEST checkpoint is achieved. This prevents the train/eval mismatch caused
-  by VecNormalize statistics drifting away from what the restored policy expects.
-  
-  The problem this solves:
-  - After rollback, the restored policy expects observations scaled with the checkpoint's stats
-  - If VecNormalize unfreezes and stats drift, evaluation uses different scaling than training
-  - This causes eval scores to collapse even when training rewards improve
-  
-  With permanent freeze:
-  - Stats remain fixed to checkpoint values
-  - Training and evaluation see identically-scaled observations
-  - Policy can be fairly evaluated against its learned behavior
+Only keeps the top K checkpoints by evaluation reward to save disk space.
+Includes all fixes from rollback_eval_callback_fixed.py plus smart checkpoint pruning.
 
-Previous enhancements:
-- v4: MIN_TIMESTEPS_BEFORE_ROLLBACK to prevent "lucky checkpoint" syndrome
-- v3: ABSOLUTE DEFICIT THRESHOLD for immediate rollback on catastrophic drops
-- v2: Buffer mismatch handling, entropy coefficient decay
-- v1: Top-K checkpoint management, optimizer state restoration
+ENHANCEMENTS (v2):
+- Buffer mismatch handling: Skip training updates after rollback to allow fresh data collection
+- Entropy coefficient decay: Reduce entropy on rollback to stabilize learning
+
+ENHANCEMENTS (v3):
+- ABSOLUTE DEFICIT THRESHOLD: Trigger immediate rollback when performance drops more than
+  a specified amount below the best, regardless of consecutive declines.
+  This prevents catastrophic forgetting from going unchecked.
+
+ENHANCEMENTS (v4):
+- MIN_TIMESTEPS_BEFORE_ROLLBACK: Delays rollback protection until a minimum number of
+  training steps have occurred. This prevents "lucky checkpoint" syndrome where an
+  early high-variance evaluation sets an unrealistically high best_reward that the
+  policy cannot reliably reproduce.
+
+Storage savings example (10M steps, 200k eval freq, K=5):
+- Without Top-K: 50 checkpoints × 6.7 MB = 335 MB
+- With Top-K=5:   5 checkpoints × 6.7 MB =  34 MB (90% reduction)
 """
 
 import json
@@ -61,7 +62,6 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
     - Decays entropy coefficient on rollback
     - Absolute deficit threshold for immediate rollback on catastrophic drops
     - Minimum timesteps before rollback to prevent "lucky checkpoint" syndrome
-    - (NEW v5) Permanent VecNormalize freeze until new best is achieved
     
     Args:
         eval_env: Evaluation environment
@@ -73,6 +73,9 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
         deficit_threshold: Absolute reward drop from best that triggers immediate rollback (default: 5.0)
                           Set to None to disable deficit-based rollback.
         min_timesteps_before_rollback: Minimum training steps before rollback is allowed (default: 0)
+                                       This prevents early "lucky" checkpoints from triggering
+                                       excessive rollbacks. Set to e.g. 2000000 to allow 2M steps
+                                       of exploration before rollback protection kicks in.
         lr_decay_factor: LR multiplier on rollback (default: 0.5)
         entropy_decay_factor: Entropy coef multiplier on rollback (default: 0.5)
         min_entropy_coef: Minimum entropy coefficient floor (default: 0.001)
@@ -80,10 +83,7 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
         min_lr_multiplier: Minimum LR multiplier floor (default: 0.1)
         max_rollbacks: Maximum rollbacks allowed (default: 10)
         activation_threshold: Reward threshold to activate rollback protection
-        freeze_normalize_steps: Steps to freeze VecNormalize after rollback (ignored if freeze_until_new_best=True)
-        freeze_vecnormalize_until_new_best: NEW (v5) - If True, keep VecNormalize frozen after rollback
-                                            until a new best checkpoint is achieved. This prevents
-                                            train/eval mismatch from VecNormalize drift.
+        freeze_normalize_steps: Steps to freeze VecNormalize after rollback
         skip_updates_after_rollback: Number of training updates to skip after rollback (default: 2)
         validate_rollback: Run evaluation immediately after rollback
         verbose: Verbosity level
@@ -99,7 +99,7 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
         max_checkpoints: int = 5,
         rollback_patience: int = 5,
         deficit_threshold: float = 5.0,
-        min_timesteps_before_rollback: int = 0,
+        min_timesteps_before_rollback: int = 0,  # NEW (v4): Minimum steps before rollback allowed
         lr_decay_factor: float = 0.5,
         entropy_decay_factor: float = 0.7,
         min_entropy_coef: float = 0.001,
@@ -109,7 +109,6 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
         activation_threshold: Optional[float] = None,
         skip_initial_eval: bool = False,
         freeze_normalize_steps: int = 50000,
-        freeze_vecnormalize_until_new_best: bool = False,  # NEW (v5)
         skip_updates_after_rollback: int = 2,
         validate_rollback: bool = True,
         verbose: int = 1,
@@ -130,7 +129,7 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
         # Rollback configuration
         self.rollback_patience = rollback_patience
         self.deficit_threshold = deficit_threshold
-        self.min_timesteps_before_rollback = min_timesteps_before_rollback
+        self.min_timesteps_before_rollback = min_timesteps_before_rollback  # NEW (v4)
         self.lr_decay_factor = lr_decay_factor
         self.entropy_decay_factor = entropy_decay_factor
         self.min_entropy_coef = min_entropy_coef
@@ -141,14 +140,10 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
         
         # Post-rollback settings
         self.freeze_normalize_steps = freeze_normalize_steps
-        self.freeze_vecnormalize_until_new_best = freeze_vecnormalize_until_new_best  # NEW (v5)
         self.skip_updates_after_rollback = skip_updates_after_rollback
         self.validate_rollback = validate_rollback
         self._normalize_frozen_until = 0
         self._original_training_mode = True
-        
-        # NEW (v5): Track permanent freeze state
-        self._vecnormalize_permanently_frozen = False
         
         # Buffer mismatch handling - skip training counter
         self._skip_train_counter = 0
@@ -205,53 +200,6 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
         
         # Replace model's train method with wrapped version
         self.model.train = wrapped_train
-
-    def _on_training_start(self) -> None:
-        """Called at the start of training."""
-        if self.skip_initial_eval:
-            self.last_eval_step = self.num_timesteps
-            if self.verbose > 0:
-                print(f"⏭️  Skipping initial evaluation (skip_initial_eval=True)")
-            return
-            
-        if self.verbose > 0:
-            print(f"\n{'='*60}")
-            print(f"🔍 INITIAL EVALUATION")
-            print(f"{'='*60}")
-        
-        # Sync normalization stats
-        try:
-            train_env = self.model.get_env()
-            if isinstance(train_env, VecNormalize) and isinstance(self.eval_env, VecNormalize):
-                self.eval_env.obs_rms = train_env.obs_rms
-                self.eval_env.ret_rms = train_env.ret_rms
-        except:
-            pass
-        
-        eval_start_time = time.time()
-        mean_reward, std_reward, mean_length, episode_rewards = self._evaluate_policy()
-        eval_time = time.time() - eval_start_time
-        
-        self.evaluations_timesteps.append(0)
-        self.evaluations_results.append(mean_reward)
-        self.evaluations_length.append(mean_length)
-        self.evaluations_std.append(std_reward)
-        
-        self.logger.record("eval/mean_reward", mean_reward)
-        self.logger.record("eval/std_reward", std_reward)
-        self.logger.record("eval/mean_ep_length", mean_length)
-        
-        if self.verbose > 0:
-            print(f" Results: {mean_reward:.2f} ± {std_reward:.2f}, Time: {eval_time:.1f}s")
-        
-        self.best_mean_reward = mean_reward
-        self.best_timestep = 0
-        self._save_best_checkpoint(mean_reward, std_reward, mean_length, episode_rewards)
-        self._save_eval_checkpoint(mean_reward)
-        
-        if self.verbose > 0:
-            print(f"⭐ INITIAL BEST MODEL saved")
-            print(f"{'='*60}\n")
 
     def _on_training_end(self) -> None:
         """Restore original train function on training end."""
@@ -317,38 +265,6 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
         
         self.logger.record("rollback/entropy_coef", new_entropy)
         self.logger.record("rollback/entropy_multiplier", self.current_entropy_multiplier)
-
-    def _evaluate_policy(self) -> Tuple[float, float, float, List[float]]:
-        """Run evaluation episodes and return mean reward, std, mean length, and episode rewards."""
-        episode_rewards = []
-        episode_lengths = []
-        
-        for ep in range(self.n_eval_episodes):
-            obs = self.eval_env.reset()
-            done = False
-            episode_reward = 0.0
-            episode_length = 0
-            
-            while not done:
-                action, _ = self.model.predict(obs, deterministic=self.deterministic)
-                obs, reward, done, info = self.eval_env.step(action)
-                episode_reward += reward[0]
-                episode_length += 1
-                
-                if done[0]:
-                    break
-            
-            episode_rewards.append(episode_reward)
-            episode_lengths.append(episode_length)
-            
-            if self.verbose > 0:
-                print(f"[EVAL EP-END] ep={ep+1}/{self.n_eval_episodes} episode={{'r': {episode_reward}, 'l': {episode_length}, 't': {time.time()}}}")
-        
-        mean_reward = np.mean(episode_rewards)
-        std_reward = np.std(episode_rewards)
-        mean_length = np.mean(episode_lengths)
-        
-        return float(mean_reward), float(std_reward), float(mean_length), episode_rewards
 
     def _save_eval_checkpoint(self, mean_reward: float) -> CheckpointInfo:
         """
@@ -560,21 +476,12 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
                     self.eval_env.obs_rms = saved_vec_env.obs_rms
                     self.eval_env.ret_rms = saved_vec_env.ret_rms
                 
-                # Store original mode and freeze
                 self._original_training_mode = vec_env.training
                 vec_env.training = False
+                self._normalize_frozen_until = self.num_timesteps + self.freeze_normalize_steps
                 
-                # NEW (v5): Handle permanent freeze vs timed freeze
-                if self.freeze_vecnormalize_until_new_best:
-                    self._vecnormalize_permanently_frozen = True
-                    self._normalize_frozen_until = 0  # Disable time-based unfreeze
-                    if self.verbose > 0:
-                        print(f"   ✓ VecNormalize restored and PERMANENTLY FROZEN until new best")
-                else:
-                    self._vecnormalize_permanently_frozen = False
-                    self._normalize_frozen_until = self.num_timesteps + self.freeze_normalize_steps
-                    if self.verbose > 0:
-                        print(f"   ✓ VecNormalize restored and FROZEN for {self.freeze_normalize_steps:,} steps")
+                if self.verbose > 0:
+                    print(f"   ✓ VecNormalize restored and FROZEN for {self.freeze_normalize_steps:,} steps")
                     
             except Exception as e:
                 if self.verbose > 0:
@@ -609,7 +516,6 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
             'new_entropy_coef': float(self.model.ent_coef),
             'best_reward_at_rollback': float(self.best_mean_reward),
             'skip_updates': int(self.skip_updates_after_rollback),
-            'vecnormalize_permanently_frozen': self._vecnormalize_permanently_frozen,  # NEW (v5)
         }
         self.rollback_events.append(rollback_event)
         
@@ -643,35 +549,128 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
         optimizer = self.model.policy.optimizer
         for group in optimizer.param_groups:
             for p in group['params']:
-                state = optimizer.state.get(p, {})
+                state = optimizer.state[p]
                 if 'exp_avg' in state:
                     state['exp_avg'].zero_()
                 if 'exp_avg_sq' in state:
                     state['exp_avg_sq'].zero_()
                 if 'step' in state:
                     state['step'] = 0
-        if self.verbose > 0:
-            print(f"   ⚠️  Optimizer state reset to fresh")
 
-    def _unfreeze_vecnormalize(self):
-        """Helper to unfreeze VecNormalize and reset permanent freeze flag."""
-        vec_env = self.model.get_env()
-        if isinstance(vec_env, VecNormalize):
-            vec_env.training = self._original_training_mode
+    def _evaluate_policy(self) -> Tuple[float, float, float, List[float]]:
+        """Run evaluation episodes."""
+        episode_rewards = []
+        episode_lengths = []
+        
+        obs = self.eval_env.reset()
+        episode_reward = 0.0
+        episode_length = 0
+        episodes_completed = 0
+        
+        while episodes_completed < self.n_eval_episodes:
+            try:
+                self.eval_env.env_method("set_global_step", int(self.num_timesteps))
+            except:
+                pass
+            
+            action, _ = self.model.predict(obs, deterministic=self.deterministic)
+            
+            try:
+                if hasattr(self.eval_env, "get_original_obs"):
+                    obs_for_gate = self.eval_env.get_original_obs()
+                    if obs_for_gate is None:
+                        obs_for_gate = obs
+                else:
+                    obs_for_gate = obs
+                gated = self.eval_env.env_method("gate_action", action[0], obs_for_gate[0], indices=[0])[0]
+                action = np.asarray([gated], dtype=np.float32)
+            except:
+                pass
+            
+            step_out = self.eval_env.step(action)
+            
+            if len(step_out) == 4:
+                obs, reward, done, infos = step_out
+            else:
+                obs, reward, terminated, truncated, infos = step_out
+                done = np.logical_or(terminated, truncated)
+            
+            episode_reward += reward[0]
+            episode_length += 1
+            
+            if done[0]:
+                info0 = infos[0] if isinstance(infos, (list, tuple)) else infos
+                ep = info0.get("episode", None)
+                
+                if self.verbose > 0:
+                    print(f"[EVAL EP-END] ep={episodes_completed+1}/{self.n_eval_episodes} episode={ep}")
+                
+                episode_rewards.append(float(episode_reward))
+                episode_lengths.append(int(episode_length))
+                episodes_completed += 1
+                
+                episode_reward = 0.0
+                episode_length = 0
+        
+        return (
+            float(np.mean(episode_rewards)),
+            float(np.std(episode_rewards)),
+            float(np.mean(episode_lengths)),
+            episode_rewards
+        )
+
+    def _on_training_start(self) -> None:
+        """Initial evaluation at timestep 0."""
+        self._base_lr_schedule = self.model.learning_rate
+        
+        if self.skip_initial_eval:
             if self.verbose > 0:
-                print(f"   ✓ VecNormalize UNFROZEN at step {self.num_timesteps:,}")
-        self._normalize_frozen_until = 0
-        self._vecnormalize_permanently_frozen = False
+                print(f"\n{'='*60}")
+                print(f"⏭️  SKIPPING initial evaluation")
+                print(f"{'='*60}\n")
+            return
+        
+        if self.verbose > 0:
+            print(f"\n{'='*60}")
+            print(f"🔍 INITIAL EVALUATION at timestep 0")
+            print(f"{'='*60}")
+        
+        eval_start_time = time.time()
+        mean_reward, std_reward, mean_length, episode_rewards = self._evaluate_policy()
+        eval_time = time.time() - eval_start_time
+        
+        self.evaluations_timesteps.append(0)
+        self.evaluations_results.append(mean_reward)
+        self.evaluations_length.append(mean_length)
+        self.evaluations_std.append(std_reward)
+        
+        self.logger.record("eval/mean_reward", mean_reward)
+        self.logger.record("eval/std_reward", std_reward)
+        self.logger.record("eval/mean_ep_length", mean_length)
+        
+        if self.verbose > 0:
+            print(f" Results: {mean_reward:.2f} ± {std_reward:.2f}, Time: {eval_time:.1f}s")
+        
+        self.best_mean_reward = mean_reward
+        self.best_timestep = 0
+        self._save_best_checkpoint(mean_reward, std_reward, mean_length, episode_rewards)
+        self._save_eval_checkpoint(mean_reward)
+        
+        if self.verbose > 0:
+            print(f"⭐ INITIAL BEST MODEL saved")
+            print(f"{'='*60}\n")
 
     def _on_step(self) -> bool:
         """Called at each step."""
         
-        # Check if we should unfreeze VecNormalize (time-based, NOT permanent)
-        # NEW (v5): Skip this if permanently frozen
-        if (not self._vecnormalize_permanently_frozen and 
-            self._normalize_frozen_until > 0 and 
-            self.num_timesteps >= self._normalize_frozen_until):
-            self._unfreeze_vecnormalize()
+        # Check if we should unfreeze VecNormalize
+        if self._normalize_frozen_until > 0 and self.num_timesteps >= self._normalize_frozen_until:
+            vec_env = self.model.get_env()
+            if isinstance(vec_env, VecNormalize):
+                vec_env.training = self._original_training_mode
+                if self.verbose > 0:
+                    print(f"   ✓ VecNormalize UNFROZEN at step {self.num_timesteps:,}")
+            self._normalize_frozen_until = 0
         
         if self.num_timesteps - self.last_eval_step >= self.eval_freq:
             self.last_eval_step = self.num_timesteps
@@ -679,9 +678,6 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
             if self.verbose > 0:
                 print(f"\n{'='*60}")
                 print(f"🔍 EVALUATION at {self.num_timesteps:,} steps")
-                # NEW (v5): Show freeze status
-                if self._vecnormalize_permanently_frozen:
-                    print(f"   📌 VecNormalize: PERMANENTLY FROZEN (waiting for new best)")
                 print(f"{'='*60}")
             
             # Sync normalization stats
@@ -730,12 +726,6 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
                 if self.verbose > 0:
                     print(f"⭐ NEW BEST MODEL! (+{improvement:.2f})")
                 
-                # NEW (v5): Unfreeze VecNormalize on new best (if permanently frozen)
-                if self._vecnormalize_permanently_frozen:
-                    if self.verbose > 0:
-                        print(f"   🔓 NEW BEST achieved - unfreezing VecNormalize!")
-                    self._unfreeze_vecnormalize()
-                
                 self.best_mean_reward = mean_reward
                 self.best_timestep = self.num_timesteps
                 self.consecutive_declines = 0
@@ -748,7 +738,10 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
                 if self.rollback_activated:
                     self.consecutive_declines += 1
                     
-                    # Check if minimum timesteps reached for rollback
+                    # ========================================================
+                    # NEW (v4): Check if minimum timesteps reached for rollback
+                    # This prevents "lucky checkpoint" syndrome
+                    # ========================================================
                     rollback_allowed = self.num_timesteps >= self.min_timesteps_before_rollback
                     
                     if self.verbose > 0:
@@ -780,7 +773,6 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
             self.logger.record("rollback/entropy_multiplier", self.current_entropy_multiplier)
             self.logger.record("rollback/best_reward", self.best_mean_reward)
             self.logger.record("rollback/n_checkpoints", len(self._checkpoint_heap))
-            self.logger.record("rollback/vecnorm_frozen", float(self._vecnormalize_permanently_frozen))  # NEW (v5)
             
             # Log deficit and rollback_allowed for monitoring
             if self.best_mean_reward > -np.inf:
@@ -812,7 +804,6 @@ class RollbackEvaluationCallbackTopK(BaseCallback):
             'max_checkpoints': int(self.max_checkpoints),
             'deficit_threshold': float(self.deficit_threshold) if self.deficit_threshold else None,
             'min_timesteps_before_rollback': int(self.min_timesteps_before_rollback),
-            'freeze_vecnormalize_until_new_best': self.freeze_vecnormalize_until_new_best,  # NEW (v5)
             'kept_checkpoints': [
                 {'timestep': c.timestep, 'reward': c.reward}
                 for c in sorted(self._checkpoint_heap, reverse=True)
