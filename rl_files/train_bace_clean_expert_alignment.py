@@ -71,9 +71,13 @@ from b_ace_py.utils import load_b_ace_config
 from b_ace_py.B_ACE_GodotPettingZooWrapper import B_ACE_GodotPettingZooWrapper
 from b_ace_py.enriched_observation_wrapper import EnrichedObservationWrapper
 from expert_alignment_wrapper import ExpertAlignmentWrapper, create_alignment_decay_fn, get_default_enriched_obs_indices
+from simple_aggressive_expert import SimpleAggressiveExpert, get_default_obs_indices
 from sustained_turn_penalty import SustainedTurnPenaltySimple
 from hvaa_destruction_penalty import HVAADestructionPenalty
-from rollback_eval_callback import RollbackEvaluationCallbackTopK as RollbackEvaluationCallback
+from rollback_eval_callback import RollbackEvaluationCallbackTopK
+from track_aware_shaping import CombinedTrackAwareShaping
+from mission_tempo_shaping_perstep import MissionTempoShapingPerStep
+from reward_breakdown_logger import RewardBreakdownLogger, CompactRewardLogger
 # from b_ace_py.reward_shaping_wrapper import RewardShapingWrapper, RewardShapingConfig  # DISABLED (no reward shaping wrapper)
 try:
     from reward_component_eval_callback import RewardComponentEvalCallback
@@ -216,36 +220,77 @@ class ActionSmoothnessPenalty(gym.Wrapper):
         return obs, rew, terminated, truncated, info
     
 class RangeClosingShaping(gym.Wrapper):
-    def __init__(self, env, range_idx: int, track_idx: int = 7, k: float = 0.02, clip_delta: float = 0.02):
+    def __init__(self, env, range_idx: int, track_idx: int = 7, 
+                 k: float = 30.0, clip_delta: float = 0.02,
+                 max_valid_delta: float = 0.05):  # NEW: filter threshold
         super().__init__(env)
         self.range_idx = int(range_idx)
         self.track_idx = int(track_idx)
         self.k = float(k)
         self.clip_delta = float(clip_delta)
+        self.max_valid_delta = float(max_valid_delta)  # Ignore deltas larger than this
         self.prev_range = None
-
+        
+        # Diagnostics
+        self._delta_history = []
+        self._shaping_history = []
+        self._step_count = 0
+        self._anomaly_count = 0
+        
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self.prev_range = float(obs[self.range_idx])
+        
+        # Print diagnostics every reset
+        #if self._delta_history:
+        #    deltas = np.array(self._delta_history)
+        #    shapings = np.array(self._shaping_history)
+        #    print(f"\n[RANGE SHAPING DIAGNOSTICS]")
+        #    print(f"  Steps: {self._step_count}, Tracked: {len(deltas)}, Anomalies filtered: {self._anomaly_count}")
+        #   if len(deltas) > 0:
+        #        print(f"  Delta - mean: {np.mean(deltas):.6f}, std: {np.std(deltas):.6f}")
+        #        print(f"  Delta - min: {np.min(deltas):.6f}, max: {np.max(deltas):.6f}")
+        #        print(f"  Shaping - total: {np.sum(shapings):.4f}, mean/step: {np.mean(shapings):.6f}")
+        #        print(f"  Positive shaping steps: {np.sum(shapings > 0)}/{len(shapings)}")
+        
+        self._delta_history = []
+        self._shaping_history = []
+        self._step_count = 0
+        self._anomaly_count = 0
+        
         return obs, info
-
+        
     def step(self, action):
         obs, rew, terminated, truncated, info = self.env.step(action)
-
         track = float(obs[self.track_idx]) > 0.5
         shaping = 0.0
+        
+        self._step_count += 1
+        
         if track and self.prev_range is not None:
             cur_r = float(obs[self.range_idx])
-            delta = float(self.prev_range - cur_r)  # positive if closing
-            delta = float(np.clip(delta, -self.clip_delta, self.clip_delta))
-            shaping = self.k * delta
-            rew = float(rew) + shaping
-            self.prev_range = cur_r
+            raw_delta = float(self.prev_range - cur_r)  # positive if closing
+            
+            # Filter out anomalous deltas (target lost, destroyed, etc.)
+            if abs(raw_delta) > self.max_valid_delta:
+                self._anomaly_count += 1
+                # Don't apply shaping, but do update prev_range
+                self.prev_range = cur_r
+            else:
+                # Normal delta - apply shaping
+                delta = float(np.clip(raw_delta, -self.clip_delta, self.clip_delta))
+                shaping = self.k * delta
+                rew = float(rew) + shaping
+                self.prev_range = cur_r
+                
+                # Track for diagnostics
+                #self._delta_history.append(raw_delta)
+                #self._shaping_history.append(shaping)
         else:
-            # if no track, still update prev_range so it stays current
             self.prev_range = float(obs[self.range_idx])
-
+            
         info["range_close_shaping"] = float(shaping)
+        
         return obs, rew, terminated, truncated, info
 
 
@@ -1008,7 +1053,7 @@ class EvaluationBasedCheckpointCallback(BaseCallback):
         log_dir: Path = None,
         verbose: int = 1,
         deterministic: bool = True,
-        skip_initial_eval: bool = False,
+        skip_initial_eval: bool = True,
     ):
         super().__init__(verbose)
         self.eval_env = eval_env
@@ -1348,7 +1393,7 @@ def _parse_args():
     parser.add_argument(
         "--final-learning-rate",
         type=float,
-        default=0.000001,
+        default=0.00001,
         help="Final learning rate after decay."
     )
     
@@ -1356,13 +1401,13 @@ def _parse_args():
     parser.add_argument(
         "--initial-entropy-coef",
         type=float,
-        default=0.0450525,
+        default=0.051,
         help="Initial entropy coefficient."
     )
     parser.add_argument(
         "--final-entropy-coef",
         type=float,
-        default=0.0254,
+        default=0.001,
         help="Final entropy coefficient after decay."
     )
     
@@ -1491,6 +1536,73 @@ def _parse_args():
     #    action="store_false",
     #    help="Disable enriched observations (use baseline 22 dims)"
     #)
+    # Individual feature toggles for enriched observations
+    # Geometry features (Category A)
+    parser.add_argument(
+        "--enable-apollonius", dest="enable_apollonius", action="store_true", default=True,
+        help="Enable Apollonius circle geometry features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-apollonius", dest="enable_apollonius", action="store_false",
+        help="Disable Apollonius circle geometry features"
+    )
+    
+    # Engagement features (Category B)
+    parser.add_argument(
+        "--enable-bez", dest="enable_bez", action="store_true", default=True,
+        help="Enable Basic Engagement Zone features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-bez", dest="enable_bez", action="store_false",
+        help="Disable Basic Engagement Zone features"
+    )
+    
+    parser.add_argument(
+        "--enable-dmc", dest="enable_dmc", action="store_true", default=True,
+        help="Enable Dynamic Maneuvering Cue features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-dmc", dest="enable_dmc", action="store_false",
+        help="Disable Dynamic Maneuvering Cue features"
+    )
+    
+    parser.add_argument(
+        "--enable-offense-wez", dest="enable_offense_wez", action="store_true", default=True,
+        help="Enable offensive Weapon Engagement Zone features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-offense-wez", dest="enable_offense_wez", action="store_false",
+        help="Disable offensive Weapon Engagement Zone features"
+    )
+    
+    parser.add_argument(
+        "--enable-offense-ttc", dest="enable_offense_ttc", action="store_true", default=True,
+        help="Enable offensive Time-To-Capture features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-offense-ttc", dest="enable_offense_ttc", action="store_false",
+        help="Disable offensive Time-To-Capture features"
+    )
+    
+    # Multi-threat and HVAA features (typically disabled by default)
+    parser.add_argument(
+        "--enable-multi-threat", dest="enable_multi_threat", action="store_true", default=False,
+        help="Enable multi-threat tracking features (default: disabled)"
+    )
+    parser.add_argument(
+        "--disable-multi-threat", dest="enable_multi_threat", action="store_false",
+        help="Disable multi-threat tracking features"
+    )
+    
+    parser.add_argument(
+        "--enable-hvaa-escort", dest="enable_hvaa_escort", action="store_true", default=False,
+        help="Enable HVAA escort-specific features (default: disabled)"
+    )
+    parser.add_argument(
+        "--disable-hvaa-escort", dest="enable_hvaa_escort", action="store_false",
+        help="Disable HVAA escort-specific features"
+    )
+
     parser.add_argument("--expert-alignment", action="store_true", default=False)
     parser.add_argument("--alignment-coef", type=float, default=0.1)
     parser.add_argument("--alignment-decay-start", type=int, default=500_000)
@@ -1660,6 +1772,13 @@ class SingleAgentBACEEnv(gym.Env):
         else:
             truncated = bool(trunc_dict)
 
+        # === DEBUG: TERMINATION SIGNAL TRACE ===
+        if terminated or truncated:
+            print(f"[SINGLE-AGENT] step={self._elapsed_steps} terminated={terminated} truncated={truncated} "
+                  f"raw_term={term_dict} raw_trunc={trunc_dict}")
+        # === END DEBUG ===
+
+
         if self._elapsed_steps >= self._max_episode_steps and not terminated:
             truncated = True
 
@@ -1759,26 +1878,37 @@ def main():
 
             # === ENRICHED OBSERVATIONS (OPTIONAL) ===
             if args.use_enriched_obs:
-                # Map ablation config to human-readable category names
-                config_to_categories = {
-                    'all': 'A+B+C (all features)',
-                    'none': 'No features (enriched wrapper active but 0 features)',
-                    'geometry_only': 'A only (GEOMETRY)',
-                    'engagement_only': 'B only (ENGAGEMENT)',
-                    'range_limited_only': 'C only (RANGE_LIMITED)',
-                    'geometry_engagement': 'A+B (GEOMETRY + ENGAGEMENT)',
-                    'geometry_range': 'A+C (GEOMETRY + RANGE_LIMITED)',
-                    'engagement_range': 'B+C (ENGAGEMENT + RANGE_LIMITED)',
-                }
+                # Build feature summary for logging
+                enabled_features = []
+                disabled_features = []
+                
+                feature_status = [
+                    ('Apollonius', args.enable_apollonius),
+                    ('BEZ', args.enable_bez),
+                    ('DMC', args.enable_dmc),
+                    ('Offense WEZ', args.enable_offense_wez),
+                    ('Offense TTC', args.enable_offense_ttc),
+                    ('Multi-Threat', args.enable_multi_threat),
+                    ('HVAA Escort', args.enable_hvaa_escort),
+                ]
+                
+                for name, enabled in feature_status:
+                    if enabled:
+                        enabled_features.append(name)
+                    else:
+                        disabled_features.append(name)
                 
                 print("\n" + "="*60)
                 print("USING ENRICHED OBSERVATIONS")
-                print(f"  Ablation Config: {args.ablation_config}")
-                print(f"  Categories: {config_to_categories.get(args.ablation_config, 'unknown')}")
+                print("="*60)
+                print("  Feature Configuration:")
+                print(f"    ✓ ENABLED:  {', '.join(enabled_features) if enabled_features else 'None'}")
+                print(f"    ✗ DISABLED: {', '.join(disabled_features) if disabled_features else 'None'}")
+                print("")
                 print("  Legend:")
-                print("    [A] GEOMETRY     = Apollonius circle + ATDDG (Weintraub 2020)")
-                print("    [B] ENGAGEMENT   = BEZ + DMC + WEZ (Von Moll 2024)")
-                print("    [C] RANGE_LIMITED = Escape heading + capture prob (Weintraub 2023)")
+                print("    [A] GEOMETRY   = Apollonius circle + ATDDG (Weintraub 2020)")
+                print("    [B] ENGAGEMENT = BEZ + DMC + WEZ (Von Moll 2024)")
+                print("    [C] RANGE_LIM  = Escape heading + capture prob (Weintraub 2023)")
                 print("="*60 + "\n")
                 
                 e = EnrichedObservationWrapper(
@@ -1790,8 +1920,16 @@ def main():
                         'capture_radius': 0.01,
                         'pursuer_range': 0.5,
                         'normalize_distance': 1.0,
+                        # Individual feature toggles from command line
+                        'enable_apollonius': args.enable_apollonius,
+                        'enable_bez': args.enable_bez,
+                        'enable_dmc': args.enable_dmc,
+                        'enable_offense_wez': args.enable_offense_wez,
+                        'enable_offense_ttc': args.enable_offense_ttc,
+                        'enable_multi_threat': args.enable_multi_threat,
+                        'enable_hvaa_escort': args.enable_hvaa_escort,
+                        'enable_reward_shaping': False,  # Use dedicated shaping wrappers instead
                     },
-                    ablation_config=args.ablation_config,
                     debug=False
                 )
             else:
@@ -1802,15 +1940,22 @@ def main():
             # === SHAPING WRAPPERS (ALWAYS APPLIED) ===
             e = HeadingRateLimitWrapper(e, hdg_idx=0, max_delta=0.15)
 
-            e = KillRewardWrapper(e, kill_reward=8.0)
+            e = KillRewardWrapper(e, kill_reward=12.0)
 
             e = ActionSmoothnessPenalty(
                 e,
                 hdg_idx=0,
                 jerk_start=0.0, jerk_end=0.0025,
-                mag_start=0.0003,  mag_end=0.012,
-                hold_steps=800_000,
+                mag_start=0.0,  mag_end=0.012,
+                hold_steps=1_500_000,
                 anneal_steps=4_500_000
+            )
+
+            e = MissionTempoShapingPerStep(
+                e,
+                penalty_per_step=-0.003,  # While red alive
+                bonus_per_step=0.005,     # After red killed
+                require_hvaa_alive=True,
             )
 
             e = SustainedTurnPenaltySimple(
@@ -1821,8 +1966,27 @@ def main():
                 penalty_coef=0.01,  # increase if still spinning
             )
             
-            e = RangeClosingShaping(e, range_idx=17, track_idx=26, k=0.2, clip_delta=0.03)
-            
+            #e = RangeClosingShaping(
+            #    e, 
+            #    range_idx=17, 
+            #    track_idx=26,
+            #    k=30.0,              # 30x increase from k=1.0
+            #    clip_delta=0.02,     # Keep current
+            #    max_valid_delta=0.05 # Filter anomalies
+            #)
+
+            e = CombinedTrackAwareShaping(
+                e,
+                range_idx=17,
+                track_idx=26,
+                track_loss_penalty=-0.3,
+                k_close=30.0,
+                asymmetry_ratio=2.0,
+                clip_delta=0.02,            # Filter large single-step deltas
+                max_valid_delta=0.05,       # Ignore anomalous jumps (target destroyed/respawned)
+                min_range_for_penalty=0.05, # Don't penalize opening when already very close
+            )
+
             e = FireCooldownWrapper(
                 e,
                 fire_idx=3,
@@ -1833,7 +1997,7 @@ def main():
                 rising_edge_after=1_500_000
             )
             
-            e = HVAASurvivalEveryNStepsBonus(e, every_n_steps=50, bonus=0.03)
+            e = HVAASurvivalEveryNStepsBonus(e, every_n_steps=50, bonus=0.02)
             # DISABLED: Large instant penalty creates high variance and credit assignment issues
             # The survival bonus provides dense positive signal instead
             # e = HVAADestructionPenalty(e, penalty=-15.0)
@@ -1844,8 +2008,8 @@ def main():
                     print("  WARNING: Expert alignment requires enriched observations!")
                     print("    Skipping ExpertAlignmentWrapper for baseline run.")
                 else:
-                    expert = AggressiveExpert(fire_threshold=0.50, aspect_limit_deg=30.0)
-                    obs_indices = get_default_enriched_obs_indices()
+                    expert = SimpleAggressiveExpert(fire_threshold=0.50, aspect_limit_deg=30.0, debug=False)
+                    obs_indices = get_default_obs_indices()  # 27-dim base indices for expert
                     alignment_decay = create_alignment_decay_fn(
                         decay_start=args.alignment_decay_start,
                         decay_end=args.alignment_decay_end,
@@ -1869,7 +2033,26 @@ def main():
                 print(f"   Enriched features [27:]: {np.round(obs[27:], 3)}")
 
             # === FINAL WRAPPERS ===
+            e = CompactRewardLogger(e, print_every_n=10) 
             e = NanGuardWrapper(e, name=("eval_env" if is_eval else "train_env"))
+
+            # === DEBUG: TERMINATION TRACE (pre-Monitor) ===
+            class _TermTrace(gym.Wrapper):
+                def __init__(self, env): 
+                    super().__init__(env)
+                    self._steps = 0
+                def reset(self, **kw):
+                    self._steps = 0
+                    return self.env.reset(**kw)
+                def step(self, action):
+                    o, r, term, trunc, i = self.env.step(action)
+                    self._steps += 1
+                    if term or trunc:
+                        print(f"[PRE-MONITOR] step={self._steps} term={term} trunc={trunc}")
+                    return o, r, term, trunc, i
+            e = _TermTrace(e)
+            # === END DEBUG ===
+
             e = Monitor(e, filename=str(Path(log_dir_str) / "monitor.csv"))
             
             obs, _ = e.reset(seed=seed)
@@ -2012,19 +2195,24 @@ def main():
     )
     
     # 2. Evaluation-based checkpoint callback (saves best model based on eval performance)
-    eval_checkpoint_callback = RollbackEvaluationCallback(
+    #    With buffer mismatch handling and entropy decay on rollback
+    eval_checkpoint_callback = RollbackEvaluationCallbackTopK(
         eval_env=eval_env,
         eval_freq=200000,
         n_eval_episodes=15,
         log_dir=log_dir,
-        rollback_patience=5,      # Rollback after 3 declines
-        lr_decay_factor=0.7,      
-        activation_threshold=12.0,  # Only activate rollback after reaching 15.0 or better
-        min_lr=1e-6,
-        max_rollbacks=10,
-        skip_initial_eval=True,   # Skip evaluation at timestep 0
+        max_checkpoints=5,
+        rollback_patience=6,
+        deficit_threshold=35.0,
+        min_timesteps_before_rollback=5_000_000,
+        lr_decay_factor=0.7,           # Less aggressive (was 0.5)
+        entropy_decay_factor=0.7,
+        min_lr_multiplier=0.4,
+        max_rollbacks=3,               # Limited rollbacks (was 10)
+        skip_initial_eval=True,
+        activation_threshold=12.0,
+        freeze_vecnormalize_until_new_best=True,  # ← NEW: Permanent freeze!
         verbose=1,
-        deterministic=True,
     )
     '''
     eval_checkpoint_callback = EvaluationBasedCheckpointCallback(

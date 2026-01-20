@@ -10,21 +10,93 @@ adding computed features like:
 - Apollonius circle geometry (time-to-capture estimates)
 - Basic Engagement Zone (BEZ) penetration
 - Dynamic Maneuvering Cue (DMC) 
-- Multi-threat safe heading cones
+- Active Target Defense (ATDDG) features for escort scenarios
+
+Feature Categories (for ablation studies):
+- APOLLONIUS: time_to_capture, capture_feasible
+  Source: Weintraub et al. 2020 "An Introduction to Pursuit-Evasion Differential Games"
+  
+- BEZ_DMC: bez_penetration, inside_bez, dmc_normalized, inside_threat
+  Source: Von Moll & Weintraub 2024 "Basic Engagement Zones"
+          Von Moll & Weintraub (draft) "Dynamic Maneuvering Cue"
+          
+- ATDDG: defense_time_ratio, in_escape_region
+  Source: Weintraub et al. 2020 "An Introduction to Pursuit-Evasion Differential Games" Section V
+  
+- WEZ: offensive_dominance
+  Source: Von Moll & Weintraub 2024 "Basic Engagement Zones"
 
 Usage:
     # In your training script, wrap the environment:
-    from enriched_observation_wrapper import EnrichedObservationWrapper
+    from enriched_observation_wrapper import EnrichedObservationWrapper, FeatureCategory
     
     env = SingleAgentBACEEnv(...)
     env = EnrichedObservationWrapper(env, obs_labels=obs_map)
+    
+    # For ablation studies:
+    env = EnrichedObservationWrapper(
+        env, 
+        enabled_categories=[FeatureCategory.APOLLONIUS, FeatureCategory.BEZ_DMC]
+    )
 """
 
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-from typing import Dict, List, Any, Optional, Tuple
-from .pursuit_evasion_features import PursuitEvasionFeatures
+from typing import Dict, List, Any, Optional, Tuple, Set
+from enum import Enum, auto
+try:
+    from .pursuit_evasion_features import PursuitEvasionFeatures
+except ImportError:
+    from pursuit_evasion_features import PursuitEvasionFeatures
+
+
+class FeatureCategory(Enum):
+    """
+    Feature categories for ablation studies.
+    Each category corresponds to theoretical foundations from specific papers.
+    
+    Three independent categories:
+    - GEOMETRY: Apollonius circle + ATDDG (Weintraub et al. 2020)
+    - ENGAGEMENT: BEZ + DMC + WEZ (Von Moll & Weintraub 2024)
+    - RANGE_LIMITED: Critical escape heading + capture probability (Weintraub et al. 2023)
+    """
+    GEOMETRY = auto()       # Weintraub et al. 2020 - Apollonius + ATDDG (intercept geometry)
+    ENGAGEMENT = auto()     # Von Moll & Weintraub 2024 - BEZ + DMC + WEZ (engagement zones)
+    RANGE_LIMITED = auto()  # Weintraub et al. 2023 - Critical escape heading, capture probability
+
+
+# Predefined configurations for ablation studies
+ABLATION_CONFIGS = {
+    'all': {FeatureCategory.GEOMETRY, FeatureCategory.ENGAGEMENT, FeatureCategory.RANGE_LIMITED},
+    'none': set(),
+    'geometry_only': {FeatureCategory.GEOMETRY},
+    'engagement_only': {FeatureCategory.ENGAGEMENT},
+    'range_limited_only': {FeatureCategory.RANGE_LIMITED},
+    'geometry_engagement': {FeatureCategory.GEOMETRY, FeatureCategory.ENGAGEMENT},
+    'geometry_range': {FeatureCategory.GEOMETRY, FeatureCategory.RANGE_LIMITED},
+    'engagement_range': {FeatureCategory.ENGAGEMENT, FeatureCategory.RANGE_LIMITED},
+}
+
+
+# Paper citations for thesis documentation
+CATEGORY_CITATIONS = {
+    FeatureCategory.GEOMETRY: {
+        'paper': 'Weintraub, I.E., Pachter, M., & Garcia, E. (2020). "An Introduction to Pursuit-Evasion Differential Games." American Control Conference.',
+        'features': ['time_to_capture', 'capture_feasible', 'defense_time_ratio', 'in_escape_region', 'barrier_value_normalized', 'heading_to_optimal_intercept'],
+        'description': 'Apollonius circle geometry for intercept times/feasibility, Active Target Defense (ATDDG) for three-agent escort scenarios, barrier hyperbola from Game of Kind (Eq. 46-47), and optimal intercept heading from Game of Degree (Eq. 49).',
+    },
+    FeatureCategory.ENGAGEMENT: {
+        'paper': 'Von Moll, A. & Weintraub, I.E. (2024). "Basic Engagement Zones." + "Dynamic Maneuvering Cue."',
+        'features': ['bez_penetration', 'inside_bez', 'dmc_normalized', 'inside_threat', 'offensive_dominance'],
+        'description': 'Engagement zone boundaries, evasive maneuver requirements (DMC), and mutual WEZ comparison.',
+    },
+    FeatureCategory.RANGE_LIMITED: {
+        'paper': 'Weintraub, I.E., Von Moll, A., & Pachter, M. (2023). "Range-Limited Pursuit-Evasion."',
+        'features': ['escape_cone_normalized', 'capture_probability_proxy'],
+        'description': 'Critical escape heading ψ_E,crit from Eq. 34 defining safe heading boundaries, and continuous capture probability based on escape/capture thresholds from Eq. 25-27.',
+    },
+}
 
 
 class EnrichedObservationWrapper(gym.Wrapper):
@@ -35,13 +107,14 @@ class EnrichedObservationWrapper(gym.Wrapper):
     This wrapper:
     1. Receives raw observations from the Godot environment
     2. Extracts agent/threat states from the observation
-    3. Computes theoretical features (Apollonius, BEZ, DMC, etc.)
+    3. Computes theoretical features (Apollonius, BEZ, DMC, ATDDG)
     4. Concatenates features to the observation
     5. Passes enriched observation to the RL agent
     
     The wrapper is designed to be:
     - Non-invasive: Doesn't modify the underlying environment
-    - Configurable: Easy to enable/disable specific features
+    - Configurable: Easy to enable/disable specific feature categories
+    - Ablation-ready: Predefined configs for systematic experiments
     - Debuggable: Can log feature values for analysis
     """
     
@@ -49,6 +122,8 @@ class EnrichedObservationWrapper(gym.Wrapper):
                  env: gym.Env,
                  obs_labels: Optional[Dict[str, int]] = None,
                  feature_config: Optional[Dict] = None,
+                 enabled_categories: Optional[Set[FeatureCategory]] = None,
+                 ablation_config: Optional[str] = None,
                  normalize_features: bool = True,
                  debug: bool = False):
         """
@@ -58,7 +133,11 @@ class EnrichedObservationWrapper(gym.Wrapper):
             env: The underlying gymnasium environment
             obs_labels: Dict mapping observation label names to indices
                        (from your B_ACE_GodotPettingZooWrapper.obs_map)
-            feature_config: Configuration for feature computation
+            feature_config: Configuration for feature computation parameters
+            enabled_categories: Set of FeatureCategory enums to enable.
+                               If None, all categories enabled.
+            ablation_config: String key from ABLATION_CONFIGS (e.g., 'all', 'none', 
+                            'apollonius_only'). Overrides enabled_categories if set.
             normalize_features: Whether to normalize features to [-1, 1]
             debug: Whether to print debug information
         """
@@ -69,11 +148,25 @@ class EnrichedObservationWrapper(gym.Wrapper):
         self.debug = debug
         
         # CRITICAL: Pass through obs_map from inner environment so FSM wrapper can find it
-        # This enables downstream wrappers to resolve observation indices correctly
         if hasattr(env, 'obs_map'):
             self.obs_map = env.obs_map
         if hasattr(env, 'observation_labels_flat'):
             self.observation_labels_flat = env.observation_labels_flat
+        
+        # Determine which feature categories to enable
+        if ablation_config is not None:
+            if ablation_config not in ABLATION_CONFIGS:
+                raise ValueError(f"Unknown ablation_config '{ablation_config}'. "
+                               f"Available: {list(ABLATION_CONFIGS.keys())}")
+            self.enabled_categories = ABLATION_CONFIGS[ablation_config]
+        elif enabled_categories is not None:
+            self.enabled_categories = set(enabled_categories)
+        else:
+            # Default: all categories enabled
+            self.enabled_categories = {FeatureCategory.GEOMETRY, FeatureCategory.ENGAGEMENT, FeatureCategory.RANGE_LIMITED}
+        
+        # Store config name for logging
+        self.ablation_config_name = ablation_config or 'custom'
         
         # Initialize feature computer with config
         config = feature_config or {}
@@ -85,13 +178,16 @@ class EnrichedObservationWrapper(gym.Wrapper):
             normalize_distance=config.get('normalize_distance', 1000.0)
         )
         
-        # Configure which features to compute
-        self.enable_apollonius = config.get('enable_apollonius', True)
-        self.enable_bez = config.get('enable_bez', True)
-        self.enable_dmc = config.get('enable_dmc', True)
-        self.enable_multi_threat = config.get('enable_multi_threat', True)
-        self.enable_offense_wez = config.get('enable_offense_wez', True)
-        self.enable_offense_ttc = config.get('enable_offense_ttc', True)
+        # Map categories to enable flags
+        # GEOMETRY = Apollonius + ATDDG (Weintraub et al. 2020)
+        # ENGAGEMENT = BEZ + DMC + WEZ (Von Moll & Weintraub 2024)
+        # RANGE_LIMITED = Critical escape heading + capture probability (Weintraub et al. 2023)
+        self.enable_apollonius = FeatureCategory.GEOMETRY in self.enabled_categories
+        self.enable_atddg = FeatureCategory.GEOMETRY in self.enabled_categories
+        self.enable_bez = FeatureCategory.ENGAGEMENT in self.enabled_categories
+        self.enable_dmc = FeatureCategory.ENGAGEMENT in self.enabled_categories
+        self.enable_offense_wez = FeatureCategory.ENGAGEMENT in self.enabled_categories
+        self.enable_range_limited = FeatureCategory.RANGE_LIMITED in self.enabled_categories
         
         # Number of additional features we'll add
         self.num_added_features = self._calculate_num_features()
@@ -105,7 +201,10 @@ class EnrichedObservationWrapper(gym.Wrapper):
         self.shaping_coefficient = config.get('shaping_coefficient', 0.1)
         
         if self.debug:
-            print(f"[EnrichedWrapper] Initialized with {self.num_added_features} additional features")
+            print(f"[EnrichedWrapper] Config: {self.ablation_config_name}")
+            print(f"[EnrichedWrapper] Enabled categories: {[c.name for c in self.enabled_categories]}")
+            print(f"[EnrichedWrapper] Features: {self.get_feature_names()}")
+            print(f"[EnrichedWrapper] Num added features: {self.num_added_features}")
             print(f"[EnrichedWrapper] Original obs shape: {self.env.observation_space.shape}")
             print(f"[EnrichedWrapper] New obs shape: {self.observation_space.shape}")
     
@@ -114,22 +213,26 @@ class EnrichedObservationWrapper(gym.Wrapper):
         
         # Differential game theory COMPUTED features only
         if self.enable_apollonius:
-            num += 2  # time_to_capture, capture_feasible (removed heading_error)
+            num += 2  # time_to_capture, capture_feasible
         
         if self.enable_bez:
-            num += 3  # penetration, inside_bez, aspect_angle
+            num += 2  # penetration, inside_bez (aspect_angle removed - already in raw obs)
         
         if self.enable_dmc:
             num += 2  # dmc_normalized, inside_threat
         
-        num += 2  # escape feasibility (always computed)
+        # ATDDG features (Weintraub et al. 2020)
+        if self.enable_atddg:
+            num += 4  # defense_time_ratio, in_escape_region, barrier_value_normalized, heading_to_optimal_intercept
+        
         if self.enable_offense_wez:
             num += 1
-        if self.enable_offense_ttc:
-            num += 1
-        # REMOVED: Multi-threat aggregate (2) - only used by disabled multithreat_shaping
         
-        return num  # Returns 9 when all features enabled
+        # Range-Limited features (Weintraub et al. 2023)
+        if self.enable_range_limited:
+            num += 2  # escape_cone_normalized, capture_probability_proxy
+        
+        return num  # Returns 13 when all features enabled
 
     
     def _setup_observation_space(self):
@@ -236,14 +339,16 @@ class EnrichedObservationWrapper(gym.Wrapper):
                 'enemy_missile_nez': obs[IDX_TRACK_ENEMY_NEZ],
                 'threat_factor': obs[IDX_TRACK_THREAT_FACTOR],
                 'offensive_factor': obs[IDX_TRACK_OFFENSIVE_FACTOR],
+            },
+            # NEW: Extract HVAA state for ATDDG calculations
+            'hvaa': {
+                'distance': obs[IDX_HVAA_DIST],
+                'altitude_diff': obs[IDX_HVAA_ALT_DIFF],
+                'angle_off': obs[IDX_HVAA_ANGLE_OFF],  # Angle from agent to HVAA
+                'heading': obs[IDX_HVAA_HDG] * 2 * np.pi,  # Convert to radians
+                'detected': obs[IDX_HVAA_DETECTED] > 0.5,
             }
         }
-        
-        #DEBUG ==========================================
-        #if self.debug or (np.random.random() < 0.01):
-        #    print(f"[ExtractState] track_detected: {obs[IDX_TRACK_DETECTED]:.4f}")
-        #    print(f"[ExtractState] track_distance: {obs[IDX_TRACK_DIST]:.4f}")
-        #    print(f"[ExtractState] Will add threat: {obs[IDX_TRACK_DETECTED] > 0.5 and obs[IDX_TRACK_DIST] > -0.99}")
 
         # Extract threat (track 201) if detected
         # Note: track_dist_201 = -1 means no valid track
@@ -286,11 +391,11 @@ class EnrichedObservationWrapper(gym.Wrapper):
         
         Optimized for B-ACE BVR air combat:
         - Uses Godot's pre-computed features where available
-        - Adds differential game theory features (Apollonius, BEZ, DMC)
+        - Adds differential game theory features (Apollonius, BEZ, DMC, ATDDG)
         - All features normalized for neural network input
         
         Args:
-            state: Extracted state dict with 'agent', 'threats', and 'godot_features'
+            state: Extracted state dict with 'agent', 'threats', 'hvaa', and 'godot_features'
             
         Returns:
             Feature vector as numpy array
@@ -299,12 +404,7 @@ class EnrichedObservationWrapper(gym.Wrapper):
         
         agent = state['agent']
         threats = state['threats']
-    
-        #if self.debug or (np.random.random() < 0.01):
-        #    print(f"[EnrichedObs] threats detected: {len(threats)}")
-        #    if threats:
-        #        print(f"  Threat distance: {threats[0]['distance']:.4f}")
-
+        hvaa = state.get('hvaa', {})
         godot = state.get('godot_features', {})
         
         agent_pos = agent['position']
@@ -331,7 +431,7 @@ class EnrichedObservationWrapper(gym.Wrapper):
             
             capture_radius = threat.get('capture_radius', 0.01)
             
-            # Compute speed ratio for theoretical calculations (but don't add to features - it's a duplicate)
+            # Compute speed ratio for theoretical calculations
             # mu = evader/pursuer, here agent is evader, threat is pursuer
             mu = self.feature_computer.compute_speed_ratio(agent_speed, threat_speed)
             
@@ -349,17 +449,6 @@ class EnrichedObservationWrapper(gym.Wrapper):
                 
                 # Capture feasibility (is threat able to intercept?)
                 features.append(1.0 if apollo['capture_feasible'] else 0.0)
-                
-                # Heading error to optimal escape
-                # (how far is agent from optimal evasion heading?)
-                #if apollo['capture_feasible'] and apollo['optimal_pursuer_heading'] != 0:
-                #    # Optimal escape is perpendicular to intercept
-                #    optimal_escape = apollo['optimal_pursuer_heading'] + np.pi/2
-                #    heading_error = optimal_escape - agent_heading
-                #    heading_error = (heading_error + np.pi) % (2 * np.pi) - np.pi
-                #    features.append(heading_error / np.pi)
-                #else:
-                #    features.append(0.0)
             
             # BEZ (Basic Engagement Zone) features
             if self.enable_bez:
@@ -373,8 +462,7 @@ class EnrichedObservationWrapper(gym.Wrapper):
                 # Binary: inside engagement zone?
                 features.append(1.0 if bez['inside_bez'] else 0.0)
                 
-                # Aspect angle (how agent is oriented relative to threat)
-                features.append(bez['aspect_angle'] / np.pi)
+                # NOTE: aspect_angle removed - already available in raw obs (IDX_TRACK_ASPECT)
             
             # DMC (Dynamic Maneuvering Cue) features
             if self.enable_dmc:
@@ -389,22 +477,69 @@ class EnrichedObservationWrapper(gym.Wrapper):
                 # Inside threat zone requiring maneuver?
                 features.append(1.0 if dmc['inside_threat'] else 0.0)
             
-            # Escape feasibility for range-limited scenario
-            escape_info = self.feature_computer.compute_escape_feasibility(
-                threat_pos, agent_pos, mu, threat_range
-            )
-            # ------------------------------------------------------------------
-            # NEW: Offensive features (WEZ dominance + offensive Apollonius TTC)
-            # ------------------------------------------------------------------
-            if self.enable_offense_wez or self.enable_offense_ttc:
-                # Approximate own/ enemy ranges:
-                #   - our_Rmax: own missile vs track (Godot feature)
-                #   - their_Rmax: enemy missile vs us (threat_range)
+            # =================================================================
+            # ATDDG (Active Target Defense) features
+            # From: Weintraub et al. "An Introduction to P-E Differential Games"
+            # Includes: defense_time_ratio, in_escape_region (existing)
+            #           barrier_value_normalized, heading_to_optimal_intercept (new)
+            # =================================================================
+            if self.enable_atddg:
+                # Estimate HVAA position from agent position + HVAA distance/angle
+                if hvaa.get('detected', False) and hvaa.get('distance', 0) > 0:
+                    # HVAA angle_off is relative to agent's heading
+                    hvaa_bearing = agent_heading + hvaa['angle_off'] * np.pi
+                    hvaa_pos = agent_pos + hvaa['distance'] * np.array([
+                        np.cos(hvaa_bearing), 
+                        np.sin(hvaa_bearing)
+                    ])
+                    hvaa_speed = 0.1  # HVAA is slow (normalized)
+                    
+                    atddg = self.feature_computer.compute_atddg_defense_features(
+                        defender_pos=agent_pos,
+                        defender_speed=agent_speed,
+                        attacker_pos=threat_pos,
+                        attacker_speed=threat_speed,
+                        target_pos=hvaa_pos,
+                        target_speed=hvaa_speed
+                    )
+                    
+                    # defense_time_ratio: <0.5 means defender can intercept before attacker reaches HVAA
+                    features.append(atddg['defense_time_ratio'])
+                    
+                    # in_escape_region: 1.0 if HVAA is geometrically defensible
+                    features.append(atddg['in_escape_region'])
+                    
+                    # Enhanced ATDDG: Barrier hyperbola from Game of Kind (Eq. 46-47)
+                    alpha = hvaa_speed / threat_speed if threat_speed > 1e-6 else 0.1
+                    barrier = self.feature_computer.compute_barrier_hyperbola_value(
+                        attacker_pos=threat_pos,
+                        target_pos=hvaa_pos,
+                        defender_pos=agent_pos,
+                        alpha=alpha
+                    )
+                    features.append(barrier['barrier_value_normalized'])
+                    
+                    # Enhanced ATDDG: Optimal intercept heading from Game of Degree (Eq. 49)
+                    opt_hdg = self.feature_computer.compute_optimal_intercept_heading(
+                        defender_pos=agent_pos,
+                        attacker_pos=threat_pos,
+                        target_pos=hvaa_pos,
+                        defender_heading=agent_heading
+                    )
+                    features.append(opt_hdg['heading_error_normalized'])
+                else:
+                    # No HVAA detected - use neutral/safe defaults
+                    features.append(0.25)  # Slightly favorable defense ratio
+                    features.append(1.0)   # Assume defensible
+                    features.append(0.0)   # Neutral barrier value
+                    features.append(0.0)   # No heading error
+            
+            # Offensive features (WEZ dominance only - offensive_ttc removed as redundant with defense_time_ratio)
+            if self.enable_offense_wez:
                 our_Rmax = godot.get('own_missile_rmax', threat_range)
                 their_Rmax = threat_range
 
                 # Compute threat velocity vector
-                # Since we don't have threat heading, estimate from relative position
                 threat_relative = threat_pos - agent_pos
                 threat_distance = np.linalg.norm(threat_relative)
                 if threat_distance > 1e-6:
@@ -412,58 +547,67 @@ class EnrichedObservationWrapper(gym.Wrapper):
                 else:
                     threat_direction = np.array([1.0, 0.0])
                 
-                # Threat velocity = speed * direction (approximate)
                 threat_velocity = threat_direction * threat_speed
 
                 offense = self.feature_computer.compute_offensive_metrics(
                     own_pos=agent_pos,
-                    own_vel=agent_velocity,  # Use velocity vector, not speed
+                    own_vel=agent_velocity,
                     tgt_pos=threat_pos,
-                    tgt_vel=threat_velocity,  # Use velocity vector, not speed
+                    tgt_vel=threat_velocity,
                     our_Rmax=our_Rmax,
                     their_Rmax=their_Rmax,
                 )
 
-                if self.enable_offense_wez:
-                    # offensive_dominance can be in [-1,1] naturally
-                    features.append(
-                        np.clip(offense.get('offensive_dominance', 0.0), -1.0, 1.0)
-                    )
-
-                if self.enable_offense_ttc:
-                    # offensive_ttc_score is defined in [0,1]
-                    features.append(
-                        np.clip(offense.get('offensive_ttc_score', 0.0), 0.0, 1.0)
-                    )
-
-
-            features.append(1.0 if escape_info['evader_always_escapes'] else 0.0)
-            features.append(1.0 if escape_info['pursuer_always_captures'] else 0.0)
+                # offensive_dominance can be in [-1,1] naturally
+                features.append(
+                    np.clip(offense.get('offensive_dominance', 0.0), -1.0, 1.0)
+                )
+            
+            # =================================================================
+            # RANGE-LIMITED PURSUIT-EVASION features
+            # From: Weintraub et al. "Range-Limited Pursuit-Evasion" (2023)
+            # =================================================================
+            if self.enable_range_limited:
+                # Use threat's distance and range for Range-Limited analysis
+                threat_dist = threat.get('distance', 0.5)
+                
+                # Critical escape heading and escape cone (Eq. 34)
+                crit = self.feature_computer.compute_critical_escape_heading(
+                    d=threat_dist,
+                    mu=mu,
+                    R=threat_range
+                )
+                # escape_cone_normalized: 1.0 = all headings safe, 0.0 = no safe headings
+                features.append(crit['escape_cone_normalized'])
+                
+                # Continuous capture probability (Eq. 25-27)
+                cap_prob = self.feature_computer.compute_capture_probability_proxy(
+                    d=threat_dist,
+                    mu=mu,
+                    R=threat_range
+                )
+                features.append(cap_prob)
             
         else:
             # No threat detected - pad with safe values
-            # Note: We don't add speed_ratio (mu) anymore - it was a duplicate
             
             if self.enable_apollonius:
                 features.extend([1.0, 0.0])  # time=max, not feasible
             
             if self.enable_bez:
-                features.extend([0.0, 0.0, 0.0])  # not penetrating, not inside, neutral aspect
+                features.extend([0.0, 0.0])  # not penetrating, not inside
             
             if self.enable_dmc:
                 features.extend([0.0, 0.0])  # no maneuver needed, not inside threat
             
-            features.extend([1.0, 0.0])  # can escape, won't be captured
-
+            if self.enable_atddg:
+                features.extend([0.25, 1.0, 0.0, 0.0])  # defense_ratio, in_escape, barrier, heading_error
+            
             if self.enable_offense_wez:
-                features.append(0.0)   # no WEZ dominance one way or another
-            if self.enable_offense_ttc:
-                features.append(0.0) 
-        
-        # =================================================================
-        # REMOVED: MULTI-THREAT AGGREGATE (2 duplicates)
-        # Only used by disabled multithreat_shaping
-        # =================================================================
+                features.append(0.0)
+            
+            if self.enable_range_limited:
+                features.extend([1.0, 0.0])  # all headings safe, no capture probability
         
         return np.array(features, dtype=np.float32)
     
@@ -573,6 +717,85 @@ class EnrichedObservationWrapper(gym.Wrapper):
             info['theoretical_features'] = enriched_obs[-self.num_added_features:]
         
         return enriched_obs, reward, terminated, truncated, info
+    
+    def get_feature_names(self) -> List[str]:
+        """Return names of enriched features for interpretability."""
+        names = []
+        if self.enable_apollonius:
+            names.extend(['time_to_capture', 'capture_feasible'])
+        if self.enable_bez:
+            names.extend(['bez_penetration', 'inside_bez'])
+        if self.enable_dmc:
+            names.extend(['dmc_normalized', 'inside_threat'])
+        if self.enable_atddg:
+            names.extend(['defense_time_ratio', 'in_escape_region', 'barrier_value_normalized', 'heading_to_optimal_intercept'])
+        if self.enable_offense_wez:
+            names.append('offensive_dominance')
+        if self.enable_range_limited:
+            names.extend(['escape_cone_normalized', 'capture_probability_proxy'])
+        return names
+    
+    def get_enabled_categories(self) -> List[str]:
+        """Return list of enabled category names."""
+        return [c.name for c in self.enabled_categories]
+    
+    def get_ablation_summary(self) -> Dict[str, Any]:
+        """
+        Get summary of current configuration for thesis documentation.
+        
+        Returns:
+            Dict with config name, enabled categories, features, and citations
+        """
+        summary = {
+            'config_name': self.ablation_config_name,
+            'enabled_categories': self.get_enabled_categories(),
+            'num_features': self.num_added_features,
+            'feature_names': self.get_feature_names(),
+            'citations': {}
+        }
+        
+        for cat in self.enabled_categories:
+            summary['citations'][cat.name] = CATEGORY_CITATIONS[cat]
+        
+        return summary
+    
+    @staticmethod
+    def get_available_configs() -> Dict[str, Set[str]]:
+        """Return all available ablation configurations."""
+        return {name: {c.name for c in cats} for name, cats in ABLATION_CONFIGS.items()}
+    
+    @staticmethod
+    def print_ablation_matrix():
+        """Print ablation study matrix for thesis documentation."""
+        print("\n" + "=" * 80)
+        print("ABLATION STUDY CONFIGURATION MATRIX")
+        print("=" * 80)
+        
+        categories = list(FeatureCategory)
+        header = f"{'Config':<20}" + "".join(f"{c.name:<15}" for c in categories) + "Features"
+        print(header)
+        print("-" * 80)
+        
+        for name, enabled in ABLATION_CONFIGS.items():
+            row = f"{name:<20}"
+            num_features = 0
+            for cat in categories:
+                if cat in enabled:
+                    row += f"{'✓':<15}"
+                    num_features += len(CATEGORY_CITATIONS[cat]['features'])
+                else:
+                    row += f"{'-':<15}"
+            row += str(num_features)
+            print(row)
+        
+        print("\n" + "=" * 80)
+        print("FEATURE CATEGORIES (Paper Sources)")
+        print("=" * 80)
+        for cat, info in CATEGORY_CITATIONS.items():
+            print(f"\n{cat.name}:")
+            print(f"  Features: {info['features']}")
+            print(f"  Paper: {info['paper']}")
+            print(f"  Description: {info['description']}")
 
 
 class FeatureOnlyWrapper(gym.Wrapper):
@@ -652,35 +875,69 @@ def create_enriched_env(base_env,
 # =============================================================================
 
 if __name__ == "__main__":
-    print("EnrichedObservationWrapper - Example Usage")
+    print("EnrichedObservationWrapper - Ablation Study Demo")
     print("=" * 50)
+    
+    # Print the ablation matrix for thesis documentation
+    EnrichedObservationWrapper.print_ablation_matrix()
     
     # Create a dummy environment for testing
     class DummyEnv(gym.Env):
         def __init__(self):
-            self.observation_space = spaces.Box(low=-10, high=10, shape=(10,), dtype=np.float32)
+            self.observation_space = spaces.Box(low=-10, high=10, shape=(27,), dtype=np.float32)
             self.action_space = spaces.Box(low=-1, high=1, shape=(4,), dtype=np.float32)
         
         def reset(self, seed=None, options=None):
-            return np.zeros(10, dtype=np.float32), {}
+            # Simulate B-ACE observation structure
+            obs = np.zeros(27, dtype=np.float32)
+            obs[0] = 0.5   # own_x
+            obs[1] = 0.5   # own_z
+            obs[5] = 0.25  # own_hdg (normalized)
+            obs[6] = 0.8   # own_speed
+            obs[9] = 0.3   # hvaa_dist
+            obs[11] = 0.1  # hvaa_angle_off
+            obs[13] = 1.0  # hvaa_detected
+            obs[17] = 0.4  # track_dist
+            obs[21] = 0.5  # enemy_rmax
+            obs[26] = 1.0  # track_detected
+            return obs, {}
         
         def step(self, action):
-            obs = np.random.randn(10).astype(np.float32)
+            obs = np.random.randn(27).astype(np.float32) * 0.1
+            obs[13] = 1.0  # hvaa_detected
+            obs[26] = 1.0  # track_detected
+            obs[17] = 0.4  # track_dist
+            obs[21] = 0.5  # enemy_rmax
             return obs, 0.0, False, False, {}
     
-    # Wrap it
-    env = DummyEnv()
-    wrapped_env = EnrichedObservationWrapper(env, debug=True)
+    # Test different ablation configurations
+    print("\n" + "=" * 50)
+    print("TESTING ABLATION CONFIGURATIONS")
+    print("=" * 50)
     
-    print(f"\nOriginal obs space: {env.observation_space}")
-    print(f"Wrapped obs space: {wrapped_env.observation_space}")
+    configs_to_test = ['all', 'none', 'geometry_only', 'engagement_only', 'range_limited_only', 'geometry_engagement']
     
-    # Test reset
-    obs, info = wrapped_env.reset()
-    print(f"\nReset observation shape: {obs.shape}")
+    for config_name in configs_to_test:
+        env = DummyEnv()
+        wrapped_env = EnrichedObservationWrapper(
+            env, 
+            ablation_config=config_name,
+            debug=False
+        )
+        
+        obs, _ = wrapped_env.reset()
+        summary = wrapped_env.get_ablation_summary()
+        
+        print(f"\nConfig: {config_name}")
+        print(f"  Obs shape: {obs.shape}")
+        print(f"  Categories: {summary['enabled_categories']}")
+        print(f"  Features ({summary['num_features']}): {summary['feature_names']}")
     
-    # Test step
-    obs, reward, term, trunc, info = wrapped_env.step(wrapped_env.action_space.sample())
-    print(f"Step observation shape: {obs.shape}")
+    # Show available configs
+    print("\n" + "=" * 50)
+    print("AVAILABLE CONFIGURATIONS:")
+    print("=" * 50)
+    for name, cats in EnrichedObservationWrapper.get_available_configs().items():
+        print(f"  {name}: {cats}")
     
-    print("\nWrapper test complete!")
+    print("\nAblation demo complete!")

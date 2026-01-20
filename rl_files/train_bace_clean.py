@@ -1842,7 +1842,8 @@ def main():
                         'pursuer_range': 0.5,
                         'normalize_distance': 1.0,
                     },
-                    ablation_config=args.ablation_config,
+                    #Testing Old enriched observation features
+                    #ablation_config=args.ablation_config,
                     debug=False
                 )
             else:

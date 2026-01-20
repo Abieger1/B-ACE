@@ -17,23 +17,61 @@ python rl_files/evaluate_single_model_multi_seed.py \
     --episodes 100 \
     --renderize 1
 
+# Evaluate all seeds in an experiment:
+python rl_files/evaluate_experiment_seeds.py 
+--experiment-dir runs_sb3/my_experiment 
+--episodes 100
 
-# EXPERIMENTAL RUN WITH SEEDS 42, 125, 456, 789, 1011
+
+
+
+# EXPERIMENTAL RUN WITH SEEDS 42, 123, 456, 789, 1011
 python rl_files/run_experiment.py \
-    --experiment-name experiment_ABC \
+    --experiment-name experiment_ABC_v2 \
     --total-timesteps 10_000_000 \
-    --seeds 42 \
+    --seeds 42 123 456 789 \
+    --use-enriched-obs \
+    --ablation-config 
+    
+
     --log-to-file
 
 
 #CONFIG 1 - Clean PPO Training
 python rl_files/train_bace_clean.py \
-  --experiment-name baseline_experiment_v8 \
-  --seed 123, 456, 789, 1011 \
-  --total-timesteps 10000000
+  --experiment-name experiment_ABC_V10 \
+  --seed 42 \
+  --total-timesteps 10000000 \
   --use-enriched-obs \
-  --ablation-config all \
+  --ablation-config all
+  
+   \
   --expert_alignment
+
+
+# A GEOMETRY only (Apollonius + ATDDG)
+python run_experiment.py --experiment-name geometry_only \
+    --use-enriched-obs --ablation-config geometry_only
+
+# B ENGAGEMENT only (BEZ + DMC + WEZ)
+python run_experiment.py --experiment-name engagement_only \
+    --use-enriched-obs --ablation-config engagement_only
+
+# C RANGE_LIMITED only (escape cone + capture prob)
+python run_experiment.py --experiment-name range_only \
+    --use-enriched-obs --ablation-config range_limited_only
+
+# GEOMETRY + ENGAGEMENT (no range-limited)
+python run_experiment.py --experiment-name geo_eng \
+    --use-enriched-obs --ablation-config geometry_engagement
+
+# GEOMETRY + RANGE_LIMITED (no engagement)
+python run_experiment.py --experiment-name geo_range \
+    --use-enriched-obs --ablation-config geometry_range
+
+# ENGAGEMENT + RANGE_LIMITED (no geometry)
+python run_experiment.py --experiment-name eng_range \
+    --use-enriched-obs --ablation-config engagement_range
 
 
 #PLOTTING SECTION - Seed 125, 456, 789, 1011
@@ -60,13 +98,13 @@ python rl_files/plot_eval_learning_curve_updated.py \
 
 # Plot all seeds (default behavior, unchanged)
 python rl_files/plot_eval_learning_curve_updated.py \
-    --experiment-dir runs_sb3/baseline_experiment_v3/ \
-    --output-file baseline_all_seeds.png \
+    --experiment-dir runs_sb3/experiment_abc_v10/ \
+    --output-file abc_v10.png \
     --title "Baseline All Seeds"
 
 #PLOT AVERAGE AMONG SSEEDS
 python rl_files/plot_multiseed_learning_curve.py \
-    --experiment-dir runs_sb3/baseline_experiment_v1 \
+    --experiment-dir runs_sb3/baseline_experiment_v8 \
     --output-file baseline_mean_5seeds.png \
     --title "Baseline (5 Seeds)"
 
