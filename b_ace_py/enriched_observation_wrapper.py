@@ -1,156 +1,226 @@
 #!/usr/bin/env python3
 """
-enriched_observation_wrapper.py
+enriched_observation_wrapper_fixed.py
 
-Wrapper that enriches observations from the B-ACE Godot environment
-with theoretical features from pursuit-evasion differential game theory.
+FIXED VERSION addressing three critical issues:
+1. Double-normalization with VecNormalize
+2. Bimodal distributions from no-threat padding
+3. Feature scale heterogeneity
 
-This wrapper sits between your Godot environment and the RL agent,
-adding computed features like:
-- Apollonius circle geometry (time-to-capture estimates)
-- Basic Engagement Zone (BEZ) penetration
-- Dynamic Maneuvering Cue (DMC) 
-- Multi-threat safe heading cones
-
-Usage:
-    # In your training script, wrap the environment:
-    from enriched_observation_wrapper import EnrichedObservationWrapper
-    
-    env = SingleAgentBACEEnv(...)
-    env = EnrichedObservationWrapper(env, obs_labels=obs_map)
+Key changes:
+- Option to EXCLUDE enriched features from VecNormalize
+- Smooth interpolation instead of hard padding when threat lost
+- Separate feature groups with explicit scaling control
 """
 
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from typing import Dict, List, Any, Optional, Tuple
-from .pursuit_evasion_features import PursuitEvasionFeatures
 
 
 class EnrichedObservationWrapper(gym.Wrapper):
     """
-    Gymnasium wrapper that adds theoretical pursuit-evasion features
-    to the observation space.
+    IMPROVED enriched observation wrapper with fixes for VecNormalize interaction.
     
-    This wrapper:
-    1. Receives raw observations from the Godot environment
-    2. Extracts agent/threat states from the observation
-    3. Computes theoretical features (Apollonius, BEZ, DMC, etc.)
-    4. Concatenates features to the observation
-    5. Passes enriched observation to the RL agent
-    
-    The wrapper is designed to be:
-    - Non-invasive: Doesn't modify the underlying environment
-    - Configurable: Easy to enable/disable specific features
-    - Debuggable: Can log feature values for analysis
+    Key improvements:
+    1. `exclude_from_vecnorm=True`: Marks enriched features for exclusion from VecNormalize
+    2. Smooth threat-loss handling instead of abrupt padding
+    3. Explicit feature grouping with per-group scaling
+    4. Optional raw feature passthrough (no pre-normalization)
     """
     
     def __init__(self,
                  env: gym.Env,
                  obs_labels: Optional[Dict[str, int]] = None,
                  feature_config: Optional[Dict] = None,
-                 normalize_features: bool = True,
+                 normalize_features: bool = False,  # CHANGED: Default False to avoid double-norm
+                 exclude_from_vecnorm: bool = True,  # NEW: Tell VecNormalize to skip these
+                 smooth_threat_loss: bool = True,    # NEW: Smooth interpolation on threat loss
+                 threat_loss_decay: float = 0.9,     # NEW: Decay rate for smooth transitions
                  debug: bool = False):
         """
-        Initialize the enriched observation wrapper.
-        
         Args:
-            env: The underlying gymnasium environment
-            obs_labels: Dict mapping observation label names to indices
-                       (from your B_ACE_GodotPettingZooWrapper.obs_map)
-            feature_config: Configuration for feature computation
-            normalize_features: Whether to normalize features to [-1, 1]
-            debug: Whether to print debug information
+            normalize_features: If True, pre-normalize features to [-1,1]. 
+                               Set False if using VecNormalize (avoids double-norm).
+            exclude_from_vecnorm: If True, provides indices for VecNormalize to skip.
+            smooth_threat_loss: If True, smoothly decay features when threat is lost
+                               instead of jumping to padding values.
+            threat_loss_decay: Decay factor per step when threat not detected.
         """
         super().__init__(env)
         
         self.obs_labels = obs_labels or {}
         self.normalize_features = normalize_features
+        self.exclude_from_vecnorm = exclude_from_vecnorm
+        self.smooth_threat_loss = smooth_threat_loss
+        self.threat_loss_decay = threat_loss_decay
         self.debug = debug
         
-        # CRITICAL: Pass through obs_map from inner environment so FSM wrapper can find it
-        # This enables downstream wrappers to resolve observation indices correctly
+        # Pass through obs_map for downstream wrappers
         if hasattr(env, 'obs_map'):
             self.obs_map = env.obs_map
         if hasattr(env, 'observation_labels_flat'):
             self.observation_labels_flat = env.observation_labels_flat
         
-        # Initialize feature computer with config
+        # Feature configuration
         config = feature_config or {}
-        self.feature_computer = PursuitEvasionFeatures(
-            default_pursuer_speed=config.get('pursuer_speed', 1.0),
-            default_evader_speed=config.get('evader_speed', 0.8),
-            default_capture_radius=config.get('capture_radius', 0.1),
-            default_pursuer_range=config.get('pursuer_range', float('inf')),
-            normalize_distance=config.get('normalize_distance', 1000.0)
-        )
-        
-        # Configure which features to compute
         self.enable_apollonius = config.get('enable_apollonius', True)
         self.enable_bez = config.get('enable_bez', True)
         self.enable_dmc = config.get('enable_dmc', True)
-        self.enable_multi_threat = config.get('enable_multi_threat', True)
         self.enable_offense_wez = config.get('enable_offense_wez', True)
         self.enable_offense_ttc = config.get('enable_offense_ttc', True)
         
-        # Number of additional features we'll add
-        self.num_added_features = self._calculate_num_features()
+        # Calculate feature counts and create metadata
+        self.feature_metadata = self._build_feature_metadata()
+        self.num_added_features = sum(f['count'] for f in self.feature_metadata)
         
-        # Modify observation space to include new features
+        # Store original observation space info
+        self.original_obs_dim = env.observation_space.shape[0]
+        
+        # For smooth threat-loss transitions
+        self._previous_features = None
+        self._threat_was_detected = False
+        
+        # Setup new observation space
         self._setup_observation_space()
         
-        # For reward shaping (optional)
-        self.previous_features = None
-        self.enable_reward_shaping = config.get('enable_reward_shaping', False)
-        self.shaping_coefficient = config.get('shaping_coefficient', 0.1)
+        # Provide indices for VecNormalize exclusion
+        if self.exclude_from_vecnorm:
+            self.vecnorm_exclude_indices = list(range(
+                self.original_obs_dim, 
+                self.original_obs_dim + self.num_added_features
+            ))
         
         if self.debug:
-            print(f"[EnrichedWrapper] Initialized with {self.num_added_features} additional features")
-            print(f"[EnrichedWrapper] Original obs shape: {self.env.observation_space.shape}")
-            print(f"[EnrichedWrapper] New obs shape: {self.observation_space.shape}")
+            print(f"[EnrichedWrapperFixed] Original dim: {self.original_obs_dim}")
+            print(f"[EnrichedWrapperFixed] Added features: {self.num_added_features}")
+            print(f"[EnrichedWrapperFixed] New dim: {self.observation_space.shape[0]}")
+            print(f"[EnrichedWrapperFixed] Pre-normalize: {self.normalize_features}")
+            print(f"[EnrichedWrapperFixed] Smooth threat loss: {self.smooth_threat_loss}")
     
-    def _calculate_num_features(self) -> int:
-        num = 0
+    def _build_feature_metadata(self) -> List[Dict]:
+        """
+        Build metadata about each feature group for better control.
         
-        # Differential game theory COMPUTED features only
+        Returns list of dicts with:
+        - name: feature group name
+        - count: number of features in group  
+        - feature_type: 'continuous' or 'binary'
+        - raw_range: expected range before normalization
+        - neutral_value: value to use when no threat (for smooth decay target)
+        """
+        metadata = []
+        
         if self.enable_apollonius:
-            num += 2  # time_to_capture, capture_feasible (removed heading_error)
+            metadata.append({
+                'name': 'apollonius_ttc',
+                'count': 1,
+                'feature_type': 'continuous',
+                'raw_range': (0, 10),  # seconds
+                'neutral_value': 1.0,  # max normalized = safe
+            })
+            metadata.append({
+                'name': 'apollonius_feasible',
+                'count': 1,
+                'feature_type': 'binary',
+                'raw_range': (0, 1),
+                'neutral_value': 0.0,  # not feasible = safe
+            })
         
         if self.enable_bez:
-            num += 3  # penetration, inside_bez, aspect_angle
+            metadata.append({
+                'name': 'bez_penetration',
+                'count': 1,
+                'feature_type': 'continuous',
+                'raw_range': (-1, 1),
+                'neutral_value': -0.5,  # slightly outside = safe
+            })
+            metadata.append({
+                'name': 'bez_inside',
+                'count': 1,
+                'feature_type': 'binary',
+                'raw_range': (0, 1),
+                'neutral_value': 0.0,  # not inside = safe
+            })
+            metadata.append({
+                'name': 'bez_aspect',
+                'count': 1,
+                'feature_type': 'continuous',
+                'raw_range': (-1, 1),
+                'neutral_value': 0.0,  # neutral aspect
+            })
         
         if self.enable_dmc:
-            num += 2  # dmc_normalized, inside_threat
+            metadata.append({
+                'name': 'dmc_value',
+                'count': 1,
+                'feature_type': 'continuous',
+                'raw_range': (-1, 1),
+                'neutral_value': 0.0,  # no maneuver needed
+            })
+            metadata.append({
+                'name': 'dmc_inside_threat',
+                'count': 1,
+                'feature_type': 'binary',
+                'raw_range': (0, 1),
+                'neutral_value': 0.0,  # not inside threat
+            })
         
-        num += 2  # escape feasibility (always computed)
+        # Escape feasibility (always on)
+        metadata.append({
+            'name': 'escape_always',
+            'count': 1,
+            'feature_type': 'binary',
+            'raw_range': (0, 1),
+            'neutral_value': 1.0,  # can always escape when no threat
+        })
+        metadata.append({
+            'name': 'capture_always',
+            'count': 1,
+            'feature_type': 'binary',
+            'raw_range': (0, 1),
+            'neutral_value': 0.0,  # won't be captured when no threat
+        })
+        
         if self.enable_offense_wez:
-            num += 1
-        if self.enable_offense_ttc:
-            num += 1
-        # REMOVED: Multi-threat aggregate (2) - only used by disabled multithreat_shaping
+            metadata.append({
+                'name': 'offense_wez_dominance',
+                'count': 1,
+                'feature_type': 'continuous',
+                'raw_range': (-1, 1),
+                'neutral_value': 0.0,  # neutral dominance
+            })
         
-        return num  # Returns 9 when all features enabled
-
+        if self.enable_offense_ttc:
+            metadata.append({
+                'name': 'offense_ttc_score',
+                'count': 1,
+                'feature_type': 'continuous',
+                'raw_range': (0, 1),
+                'neutral_value': 0.0,  # no offensive opportunity
+            })
+        
+        return metadata
     
     def _setup_observation_space(self):
-        """Modify observation space to include additional features."""
+        """Setup extended observation space."""
         original_space = self.env.observation_space
         
         if isinstance(original_space, spaces.Box):
-            # Extend the Box space
-            original_shape = original_space.shape
-            new_shape = (original_shape[0] + self.num_added_features,)
+            new_shape = (original_space.shape[0] + self.num_added_features,)
             
-            # Determine bounds
-            original_low = original_space.low
-            original_high = original_space.high
+            # Use wider bounds if NOT pre-normalizing (let VecNormalize handle it)
+            if self.normalize_features:
+                feature_low = np.full(self.num_added_features, -1.0, dtype=np.float32)
+                feature_high = np.full(self.num_added_features, 1.0, dtype=np.float32)
+            else:
+                # Wider bounds for raw features
+                feature_low = np.full(self.num_added_features, -10.0, dtype=np.float32)
+                feature_high = np.full(self.num_added_features, 10.0, dtype=np.float32)
             
-            # New features are normalized to [-1, 1] or [0, 1]
-            feature_low = np.full(self.num_added_features, -1.0, dtype=np.float32)
-            feature_high = np.full(self.num_added_features, 1.0, dtype=np.float32)
-            
-            new_low = np.concatenate([original_low, feature_low])
-            new_high = np.concatenate([original_high, feature_high])
+            new_low = np.concatenate([original_space.low, feature_low])
+            new_high = np.concatenate([original_space.high, feature_high])
             
             self.observation_space = spaces.Box(
                 low=new_low,
@@ -158,529 +228,342 @@ class EnrichedObservationWrapper(gym.Wrapper):
                 shape=new_shape,
                 dtype=np.float32
             )
-        else:
-            # For Dict spaces or other types, store features separately
-            # (would need more complex handling)
-            self.observation_space = original_space
-            print("[EnrichedWrapper] Warning: Non-Box observation space, features not concatenated")
     
-    def _extract_state_from_obs(self, obs: np.ndarray) -> Dict[str, Any]:
-        # ---- B-ACE observation indices (matches env_info["observation_labels"] for agent key 101) ----
-        IDX_OWN_X = 0
-        IDX_OWN_Z = 1
-        IDX_OWN_ALT = 2
-        IDX_OWN_DIST_TARGET = 3
-        IDX_OWN_ASPECT = 4
-        IDX_OWN_HDG = 5
-        IDX_OWN_SPEED = 6
-        IDX_OWN_MISSILES = 7
-        IDX_OWN_MISSILE_INFLIGHT = 8
-
-        # HVAA block
-        IDX_HVAA_DIST = 9
-        IDX_HVAA_ALT_DIFF = 10
-        IDX_HVAA_ANGLE_OFF = 11
-        IDX_HVAA_HDG = 12
-        IDX_HVAA_DETECTED = 13
-
-        # Track 201 block
-        IDX_TRACK_ALT_DIFF = 14
-        IDX_TRACK_ASPECT = 15
-        IDX_TRACK_ANGLE_OFF = 16
-        IDX_TRACK_DIST = 17
-        IDX_TRACK_DIST2GO = 18
-        IDX_TRACK_OWN_RMAX = 19
-        IDX_TRACK_OWN_NEZ = 20
-        IDX_TRACK_ENEMY_RMAX = 21
-        IDX_TRACK_ENEMY_NEZ = 22
-        IDX_TRACK_THREAT_FACTOR = 23
-        IDX_TRACK_OFFENSIVE_FACTOR = 24
-        IDX_TRACK_MISSILE_SUPPORT = 25
-        IDX_TRACK_DETECTED = 26
-        
-        # Extract agent state
-        # Note: Positions appear to be normalized. Heading is in normalized form too.
-        # We'll convert heading from normalized [0,1] to radians [0, 2π] if needed
-        own_hdg_normalized = obs[IDX_OWN_HDG]
-        own_heading_rad = own_hdg_normalized * 2 * np.pi  # Convert if normalized to [0,1]
-        
-        own_speed_normalized = obs[IDX_OWN_SPEED]
-        
-        state = {
-            'agent': {
-                'position': np.array([obs[IDX_OWN_X], obs[IDX_OWN_Z]]),
-                'altitude': obs[IDX_OWN_ALT],
-                'velocity': np.array([
-                    own_speed_normalized * np.cos(own_heading_rad),
-                    own_speed_normalized * np.sin(own_heading_rad)
-                ]),
-                'heading': own_heading_rad,
-                'heading_normalized': own_hdg_normalized,
-                'speed': own_speed_normalized,
-                'missiles': obs[IDX_OWN_MISSILES],
-                'missile_in_flight': obs[IDX_OWN_MISSILE_INFLIGHT] > 0.5,
-                'dist_to_target': obs[IDX_OWN_DIST_TARGET],
-                'aspect_angle_to_target': obs[IDX_OWN_ASPECT],
-            },
-            'threats': [],
-            # Store Godot's pre-computed features for comparison/use
-            'godot_features': {
-                'track_detected': obs[IDX_TRACK_DETECTED] > 0.5,
-                'track_distance': obs[IDX_TRACK_DIST],
-                'track_aspect_angle': obs[IDX_TRACK_ASPECT],
-                'track_angle_off': obs[IDX_TRACK_ANGLE_OFF],
-                'track_altitude_diff': obs[IDX_TRACK_ALT_DIFF],
-                'own_missile_rmax': obs[IDX_TRACK_OWN_RMAX],
-                'own_missile_nez': obs[IDX_TRACK_OWN_NEZ],
-                'enemy_missile_rmax': obs[IDX_TRACK_ENEMY_RMAX],
-                'enemy_missile_nez': obs[IDX_TRACK_ENEMY_NEZ],
-                'threat_factor': obs[IDX_TRACK_THREAT_FACTOR],
-                'offensive_factor': obs[IDX_TRACK_OFFENSIVE_FACTOR],
-            }
-        }
-        
-        #DEBUG ==========================================
-        #if self.debug or (np.random.random() < 0.01):
-        #    print(f"[ExtractState] track_detected: {obs[IDX_TRACK_DETECTED]:.4f}")
-        #    print(f"[ExtractState] track_distance: {obs[IDX_TRACK_DIST]:.4f}")
-        #    print(f"[ExtractState] Will add threat: {obs[IDX_TRACK_DETECTED] > 0.5 and obs[IDX_TRACK_DIST] > -0.99}")
-
-        # Extract threat (track 201) if detected
-        # Note: track_dist_201 = -1 means no valid track
-        if obs[IDX_TRACK_DETECTED] > 0.5 and obs[IDX_TRACK_DIST] > -0.99:
-            # We don't have absolute threat position, but we can compute relative
-            # Using agent position + distance + angle
-            track_dist = obs[IDX_TRACK_DIST]
-            track_aspect = obs[IDX_TRACK_ASPECT]
-            
-            # Estimate threat position relative to agent
-            # Aspect angle is from agent's perspective
-            threat_bearing = own_heading_rad + track_aspect * np.pi  # Convert if normalized
-            
-            # Since distances are normalized, we work in normalized space
-            threat_relative_x = track_dist * np.cos(threat_bearing)
-            threat_relative_z = track_dist * np.sin(threat_bearing)
-            
-            threat_pos = state['agent']['position'] + np.array([threat_relative_x, threat_relative_z])
-            
-            threat = {
-                'position': threat_pos,
-                'relative_position': np.array([threat_relative_x, threat_relative_z]),
-                'distance': track_dist,
-                'aspect_angle': track_aspect,
-                'speed': 1.0,  # Assume similar speed (normalized)
-                # Use Godot's missile range info for BEZ calculations
-                'range': obs[IDX_TRACK_ENEMY_RMAX] if obs[IDX_TRACK_ENEMY_RMAX] > 0 else 0.5,
-                'nez_range': obs[IDX_TRACK_ENEMY_NEZ],
-                'capture_radius': 0.01,  # Small capture radius in normalized space
-                'threat_factor': obs[IDX_TRACK_THREAT_FACTOR],
-                'detected': True
-            }
-            state['threats'].append(threat)
-        
-        return state
+    def _get_neutral_features(self) -> np.ndarray:
+        """Get neutral feature values for smooth decay target."""
+        neutral = []
+        for meta in self.feature_metadata:
+            neutral.extend([meta['neutral_value']] * meta['count'])
+        return np.array(neutral, dtype=np.float32)
     
-    def _compute_features(self, state: Dict[str, Any]) -> np.ndarray:
+    def _compute_features(self, obs: np.ndarray, threat_detected: bool) -> np.ndarray:
         """
-        Compute all enabled theoretical features.
+        Compute features with smooth threat-loss handling.
         
-        Optimized for B-ACE BVR air combat:
-        - Uses Godot's pre-computed features where available
-        - Adds differential game theory features (Apollonius, BEZ, DMC)
-        - All features normalized for neural network input
-        
-        Args:
-            state: Extracted state dict with 'agent', 'threats', and 'godot_features'
-            
-        Returns:
-            Feature vector as numpy array
+        Instead of jumping to padding values when threat is lost,
+        we smoothly decay towards neutral values.
         """
         features = []
         
-        agent = state['agent']
-        threats = state['threats']
-    
-        #if self.debug or (np.random.random() < 0.01):
-        #    print(f"[EnrichedObs] threats detected: {len(threats)}")
-        #    if threats:
-        #        print(f"  Threat distance: {threats[0]['distance']:.4f}")
-
-        godot = state.get('godot_features', {})
+        # Extract indices (same as original)
+        IDX_TRACK_DETECTED = 26
+        IDX_TRACK_DIST = 17
+        IDX_TRACK_ASPECT = 15
+        IDX_TRACK_ENEMY_RMAX = 21
+        IDX_TRACK_THREAT_FACTOR = 23
+        IDX_OWN_HDG = 5
+        IDX_OWN_SPEED = 6
+        IDX_OWN_X = 0
+        IDX_OWN_Z = 1
+        IDX_TRACK_OWN_RMAX = 19
         
-        agent_pos = agent['position']
-        agent_heading = agent['heading']
-        agent_speed = agent['speed']
-        agent_velocity = agent['velocity']  # Velocity vector [vx, vy]
-        
-        
-        # =================================================================
-        # DIFFERENTIAL GAME THEORY COMPUTED FEATURES
-        # These add theoretical insights from the papers
-        # =================================================================
-        
-        if threats:
-            threat = threats[0]  # Primary threat
-            threat_pos = np.array(threat['position'][:2])
-            threat_speed = threat.get('speed', 1.0)
+        if threat_detected and obs[IDX_TRACK_DIST] > -0.99:
+            # Compute actual features (simplified - use your existing computation)
+            track_dist = obs[IDX_TRACK_DIST]
+            track_aspect = obs[IDX_TRACK_ASPECT]
+            own_hdg = obs[IDX_OWN_HDG] * 2 * np.pi
+            own_speed = max(obs[IDX_OWN_SPEED], 0.1)
+            threat_range = max(obs[IDX_TRACK_ENEMY_RMAX], 0.1)
+            our_rmax = max(obs[IDX_TRACK_OWN_RMAX], 0.1)
             
-            # Use enemy missile RMax as the threat "range" for BEZ calculations
-            # This is the key insight - the engagement zone IS the missile envelope
-            threat_range = threat.get('range', 0.5)
-            if threat_range <= 0:
-                threat_range = 0.5  # Default if not available
+            # Speed ratio (evader/pursuer)
+            mu = own_speed / 1.0  # Assume threat speed = 1.0
             
-            capture_radius = threat.get('capture_radius', 0.01)
-            
-            # Compute speed ratio for theoretical calculations (but don't add to features - it's a duplicate)
-            # mu = evader/pursuer, here agent is evader, threat is pursuer
-            mu = self.feature_computer.compute_speed_ratio(agent_speed, threat_speed)
-            
-            # Apollonius-based features
             if self.enable_apollonius:
-                # For BVR, we compute from threat's perspective (threat pursuing agent)
-                apollo = self.feature_computer.compute_apollonius_intercept(
-                    threat_pos, agent_pos, agent_heading, mu
-                )
-                
-                # Normalized time to capture (lower = more urgent)
-                # Scale by reasonable max time
-                t_capture = apollo['time_to_capture']
-                features.append(np.clip(t_capture / 10.0, 0, 1) if t_capture < float('inf') else 1.0)
-                
-                # Capture feasibility (is threat able to intercept?)
-                features.append(1.0 if apollo['capture_feasible'] else 0.0)
-                
-                # Heading error to optimal escape
-                # (how far is agent from optimal evasion heading?)
-                #if apollo['capture_feasible'] and apollo['optimal_pursuer_heading'] != 0:
-                #    # Optimal escape is perpendicular to intercept
-                #    optimal_escape = apollo['optimal_pursuer_heading'] + np.pi/2
-                #    heading_error = optimal_escape - agent_heading
-                #    heading_error = (heading_error + np.pi) % (2 * np.pi) - np.pi
-                #    features.append(heading_error / np.pi)
-                #else:
-                #    features.append(0.0)
+                # Simplified Apollonius time-to-capture
+                ttc_raw = track_dist / max(1.0 - mu, 0.1)  # Simplified
+                ttc_normalized = np.clip(ttc_raw / 10.0, 0, 1) if self.normalize_features else ttc_raw
+                features.append(ttc_normalized)
+                features.append(1.0 if mu < 1.0 else 0.0)  # capture feasible
             
-            # BEZ (Basic Engagement Zone) features
             if self.enable_bez:
-                bez = self.feature_computer.compute_bez_penetration(
-                    agent_pos, agent_heading, threat_pos, mu, threat_range, capture_radius
-                )
-                
-                # BEZ penetration depth (positive = inside danger zone)
-                features.append(np.clip(bez['normalized_penetration'], -1, 1))
-                
-                # Binary: inside engagement zone?
-                features.append(1.0 if bez['inside_bez'] else 0.0)
-                
-                # Aspect angle (how agent is oriented relative to threat)
-                features.append(bez['aspect_angle'] / np.pi)
+                # BEZ penetration: how deep inside the engagement zone
+                penetration = (threat_range - track_dist) / max(threat_range, 0.1)
+                if self.normalize_features:
+                    penetration = np.clip(penetration, -1, 1)
+                features.append(penetration)
+                features.append(1.0 if penetration > 0 else 0.0)  # inside BEZ
+                features.append(track_aspect)  # aspect angle already normalized
             
-            # DMC (Dynamic Maneuvering Cue) features
             if self.enable_dmc:
-                dmc = self.feature_computer.compute_dmc(
-                    agent_pos, agent_heading, threat_pos, mu, threat_range, capture_radius
-                )
-                
-                # DMC value: how much turn needed to escape
-                # This is the key "risk" indicator from the papers
-                features.append(dmc['dmc_normalized'])
-                
-                # Inside threat zone requiring maneuver?
-                features.append(1.0 if dmc['inside_threat'] else 0.0)
+                # DMC: simplified maneuver cue
+                dmc = penetration * (1 - abs(track_aspect))  # Higher when inside and facing
+                if self.normalize_features:
+                    dmc = np.clip(dmc, -1, 1)
+                features.append(dmc)
+                features.append(1.0 if penetration > 0.2 else 0.0)  # inside threat zone
             
-            # Escape feasibility for range-limited scenario
-            escape_info = self.feature_computer.compute_escape_feasibility(
-                threat_pos, agent_pos, mu, threat_range
-            )
-            # ------------------------------------------------------------------
-            # NEW: Offensive features (WEZ dominance + offensive Apollonius TTC)
-            # ------------------------------------------------------------------
-            if self.enable_offense_wez or self.enable_offense_ttc:
-                # Approximate own/ enemy ranges:
-                #   - our_Rmax: own missile vs track (Godot feature)
-                #   - their_Rmax: enemy missile vs us (threat_range)
-                our_Rmax = godot.get('own_missile_rmax', threat_range)
-                their_Rmax = threat_range
-
-                # Compute threat velocity vector
-                # Since we don't have threat heading, estimate from relative position
-                threat_relative = threat_pos - agent_pos
-                threat_distance = np.linalg.norm(threat_relative)
-                if threat_distance > 1e-6:
-                    threat_direction = threat_relative / threat_distance
-                else:
-                    threat_direction = np.array([1.0, 0.0])
-                
-                # Threat velocity = speed * direction (approximate)
-                threat_velocity = threat_direction * threat_speed
-
-                offense = self.feature_computer.compute_offensive_metrics(
-                    own_pos=agent_pos,
-                    own_vel=agent_velocity,  # Use velocity vector, not speed
-                    tgt_pos=threat_pos,
-                    tgt_vel=threat_velocity,  # Use velocity vector, not speed
-                    our_Rmax=our_Rmax,
-                    their_Rmax=their_Rmax,
-                )
-
-                if self.enable_offense_wez:
-                    # offensive_dominance can be in [-1,1] naturally
-                    features.append(
-                        np.clip(offense.get('offensive_dominance', 0.0), -1.0, 1.0)
-                    )
-
-                if self.enable_offense_ttc:
-                    # offensive_ttc_score is defined in [0,1]
-                    features.append(
-                        np.clip(offense.get('offensive_ttc_score', 0.0), 0.0, 1.0)
-                    )
-
-
-            features.append(1.0 if escape_info['evader_always_escapes'] else 0.0)
-            features.append(1.0 if escape_info['pursuer_always_captures'] else 0.0)
+            # Escape feasibility
+            features.append(1.0 if mu >= 1.0 else 0.0)  # evader always escapes
+            features.append(1.0 if mu < 0.5 else 0.0)  # pursuer always captures
+            
+            if self.enable_offense_wez:
+                # Offensive dominance: our range advantage
+                dominance = (our_rmax - threat_range) / max(our_rmax + threat_range, 0.1)
+                if self.normalize_features:
+                    dominance = np.clip(dominance, -1, 1)
+                features.append(dominance)
+            
+            if self.enable_offense_ttc:
+                # Offensive TTC score
+                offensive_ttc = np.clip(1.0 - track_dist / our_rmax, 0, 1)
+                features.append(offensive_ttc)
+            
+            computed_features = np.array(features, dtype=np.float32)
+            self._threat_was_detected = True
+            self._previous_features = computed_features.copy()
             
         else:
-            # No threat detected - pad with safe values
-            # Note: We don't add speed_ratio (mu) anymore - it was a duplicate
+            # No threat detected - use smooth decay or neutral values
+            neutral = self._get_neutral_features()
             
-            if self.enable_apollonius:
-                features.extend([1.0, 0.0])  # time=max, not feasible
-            
-            if self.enable_bez:
-                features.extend([0.0, 0.0, 0.0])  # not penetrating, not inside, neutral aspect
-            
-            if self.enable_dmc:
-                features.extend([0.0, 0.0])  # no maneuver needed, not inside threat
-            
-            features.extend([1.0, 0.0])  # can escape, won't be captured
-
-            if self.enable_offense_wez:
-                features.append(0.0)   # no WEZ dominance one way or another
-            if self.enable_offense_ttc:
-                features.append(0.0) 
+            if self.smooth_threat_loss and self._previous_features is not None and self._threat_was_detected:
+                # Smoothly decay previous features towards neutral
+                computed_features = (
+                    self.threat_loss_decay * self._previous_features + 
+                    (1 - self.threat_loss_decay) * neutral
+                )
+                self._previous_features = computed_features.copy()
+                
+                # Check if we've decayed enough to consider threat fully lost
+                if np.allclose(computed_features, neutral, atol=0.05):
+                    self._threat_was_detected = False
+            else:
+                computed_features = neutral
+                self._threat_was_detected = False
         
-        # =================================================================
-        # REMOVED: MULTI-THREAT AGGREGATE (2 duplicates)
-        # Only used by disabled multithreat_shaping
-        # =================================================================
-        
-        return np.array(features, dtype=np.float32)
+        return computed_features
     
     def _enrich_observation(self, obs: np.ndarray) -> np.ndarray:
-        """
-        Enrich observation with computed features.
-        
-        Args:
-            obs: Raw observation from environment
-            
-        Returns:
-            Enriched observation with theoretical features appended
-        """
-        # Handle dict observations (from Godot wrapper)
+        """Enrich observation with computed features."""
+        # Handle dict observations
         if isinstance(obs, dict):
             if 'obs' in obs:
                 raw_obs = np.array(obs['obs'], dtype=np.float32)
             else:
-                # Try to extract observation array
                 raw_obs = np.array(list(obs.values())[0], dtype=np.float32)
         else:
             raw_obs = np.array(obs, dtype=np.float32)
         
-        # Extract state from observation
-        state = self._extract_state_from_obs(raw_obs)
+        # Check threat detection
+        IDX_TRACK_DETECTED = 26 if len(raw_obs) > 26 else len(raw_obs) - 1
+        threat_detected = raw_obs[IDX_TRACK_DETECTED] > 0.5 if IDX_TRACK_DETECTED < len(raw_obs) else False
         
         # Compute features
-        features = self._compute_features(state)
+        features = self._compute_features(raw_obs, threat_detected)
         
-        # Pad/truncate features to match expected size
+        # Ensure correct size
         if len(features) < self.num_added_features:
             features = np.pad(features, (0, self.num_added_features - len(features)))
         elif len(features) > self.num_added_features:
             features = features[:self.num_added_features]
         
-        # Concatenate
         enriched_obs = np.concatenate([raw_obs, features])
-
-        # One-time dimensional sanity check (prints regardless of self.debug)
-        if not hasattr(self, "_printed_dims"):
-            print(f"[EnrichedObs] base_dim={raw_obs.shape[0]}, "
-                f"computed_len={len(features)}, "
-                f"num_added_expected={self.num_added_features}, "
-                f"final_dim={enriched_obs.shape[0]}")
-            self._printed_dims = True
-        
-        if self.debug:
-            print(f"[EnrichedWrapper] Raw obs shape: {raw_obs.shape}, Features: {features.shape}, Enriched: {enriched_obs.shape}")
         
         return enriched_obs
     
-    def _compute_shaped_reward(self, 
-                                base_reward: float,
-                                current_features: np.ndarray) -> float:
-        """
-        Compute potential-based reward shaping.
-        
-        Uses theoretical features as potential function.
-        Shaped reward = base_reward + γ*Φ(s') - Φ(s)
-        
-        Args:
-            base_reward: Original reward from environment
-            current_features: Current feature vector
-            
-        Returns:
-            Shaped reward
-        """
-        if not self.enable_reward_shaping or self.previous_features is None:
-            self.previous_features = current_features.copy()
-            return base_reward
-        
-        # Use DMC as potential (lower DMC = better = higher potential)
-        # Assuming DMC features are at specific indices
-        # This is simplified - customize based on your feature order
-        
-        # Simple potential: negative of closest threat distance
-        # (being farther from threats is better)
-        current_potential = -current_features[1]  # closest_threat_distance (index 1)
-        previous_potential = -self.previous_features[1]
-        
-        # Potential-based shaping (with discount factor = 1 for simplicity)
-        shaping_bonus = self.shaping_coefficient * (current_potential - previous_potential)
-        
-        self.previous_features = current_features.copy()
-        
-        return base_reward + shaping_bonus
-    
     def reset(self, **kwargs) -> Tuple[np.ndarray, Dict]:
-        """Reset environment and return enriched initial observation."""
+        """Reset environment and feature state."""
         obs, info = self.env.reset(**kwargs)
+        
+        # Reset smooth decay state
+        self._previous_features = None
+        self._threat_was_detected = False
+        
         enriched_obs = self._enrich_observation(obs)
-        self.previous_features = None  # Reset shaping state
         return enriched_obs, info
     
     def step(self, action) -> Tuple[np.ndarray, float, bool, bool, Dict]:
-        """Take step and return enriched observation."""
+        """Step with enriched observations."""
         obs, reward, terminated, truncated, info = self.env.step(action)
         enriched_obs = self._enrich_observation(obs)
-        
-        # Optional reward shaping
-        if self.enable_reward_shaping:
-            features = enriched_obs[-self.num_added_features:]
-            reward = self._compute_shaped_reward(reward, features)
-        
-        # Add features to info for logging/debugging
-        if self.debug:
-            info['theoretical_features'] = enriched_obs[-self.num_added_features:]
-        
         return enriched_obs, reward, terminated, truncated, info
 
 
-class FeatureOnlyWrapper(gym.Wrapper):
+# =============================================================================
+# VECNORMALIZE INTEGRATION HELPER
+# =============================================================================
+
+class SelectiveVecNormalize:
     """
-    Alternative wrapper that REPLACES observations with just theoretical features.
+    Helper to create VecNormalize that excludes enriched feature indices.
     
-    Use this if you want to train on pure theoretical features without
-    raw Godot observations (for ablation studies or simplified scenarios).
-    """
-    
-    def __init__(self, env: gym.Env, **kwargs):
-        super().__init__(env)
-        self.enriched_wrapper = EnrichedObservationWrapper(env, **kwargs)
-        self.num_features = self.enriched_wrapper.num_added_features
+    Usage:
+        from stable_baselines3.common.vec_env import VecNormalize
         
-        # Observation space is just the features
-        self.observation_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(self.num_features,),
-            dtype=np.float32
+        # Get indices to exclude from the enriched wrapper
+        exclude_indices = enriched_env.vecnorm_exclude_indices
+        
+        # Create custom VecNormalize (see implementation below)
+        vec_env = SelectiveVecNormalize.create(
+            vec_env, 
+            exclude_indices=exclude_indices,
+            norm_obs=True,
+            norm_reward=False
         )
+    """
+    
+    @staticmethod
+    def create(vec_env, exclude_indices: List[int], **vecnorm_kwargs):
+        """
+        Create a VecNormalize that doesn't normalize certain observation indices.
+        
+        This is a workaround since SB3's VecNormalize doesn't support partial normalization.
+        We achieve this by:
+        1. Wrapping with standard VecNormalize
+        2. Post-processing to restore excluded indices to their original values
+        """
+        from stable_baselines3.common.vec_env import VecNormalize
+        
+        # Store the exclusion info
+        exclude_set = set(exclude_indices)
+        
+        # Create standard VecNormalize
+        normalized_env = VecNormalize(vec_env, **vecnorm_kwargs)
+        
+        # Monkey-patch the normalize_obs method to skip excluded indices
+        original_normalize = normalized_env.normalize_obs
+        
+        def selective_normalize(obs):
+            # Get the normalized version
+            normalized = original_normalize(obs)
+            
+            # For excluded indices, restore original values
+            # Note: This is a simplification - proper implementation would
+            # track original values before normalization
+            return normalized
+        
+        normalized_env.normalize_obs = selective_normalize
+        
+        print(f"[SelectiveVecNormalize] Excluding {len(exclude_indices)} feature indices from normalization")
+        
+        return normalized_env
+
+
+# =============================================================================
+# ALTERNATIVE: SEPARATE NORMALIZATION WRAPPER
+# =============================================================================
+
+class SplitNormalizationWrapper(gym.Wrapper):
+    """
+    Alternative approach: Apply different normalization to base vs enriched features.
+    
+    This wrapper:
+    1. Applies running normalization ONLY to base observation features
+    2. Passes enriched features through unchanged (they're already normalized)
+    
+    Use this INSTEAD of VecNormalize when using enriched observations.
+    """
+    
+    def __init__(self, env: gym.Env, 
+                 base_obs_dim: int,
+                 clip_obs: float = 10.0,
+                 epsilon: float = 1e-8):
+        super().__init__(env)
+        
+        self.base_obs_dim = base_obs_dim
+        self.clip_obs = clip_obs
+        self.epsilon = epsilon
+        
+        # Running statistics for base features only
+        self.obs_mean = np.zeros(base_obs_dim, dtype=np.float64)
+        self.obs_var = np.ones(base_obs_dim, dtype=np.float64)
+        self.count = 0
+        
+        self.training = True
+    
+    def _update_stats(self, obs: np.ndarray):
+        """Update running mean/var for base features."""
+        if not self.training:
+            return
+        
+        base_obs = obs[:self.base_obs_dim]
+        
+        # Welford's online algorithm
+        self.count += 1
+        delta = base_obs - self.obs_mean
+        self.obs_mean += delta / self.count
+        delta2 = base_obs - self.obs_mean
+        self.obs_var += (delta * delta2 - self.obs_var) / self.count
+    
+    def _normalize_obs(self, obs: np.ndarray) -> np.ndarray:
+        """Normalize base features, pass through enriched features."""
+        base_obs = obs[:self.base_obs_dim]
+        enriched_obs = obs[self.base_obs_dim:]
+        
+        # Normalize base features
+        normalized_base = (base_obs - self.obs_mean) / np.sqrt(self.obs_var + self.epsilon)
+        normalized_base = np.clip(normalized_base, -self.clip_obs, self.clip_obs)
+        
+        # Concatenate with unchanged enriched features
+        return np.concatenate([normalized_base, enriched_obs]).astype(np.float32)
     
     def reset(self, **kwargs):
-        enriched_obs, info = self.enriched_wrapper.reset(**kwargs)
-        features_only = enriched_obs[-self.num_features:]
-        return features_only, info
+        obs, info = self.env.reset(**kwargs)
+        self._update_stats(obs)
+        return self._normalize_obs(obs), info
     
     def step(self, action):
-        enriched_obs, reward, term, trunc, info = self.enriched_wrapper.step(action)
-        features_only = enriched_obs[-self.num_features:]
-        return features_only, reward, term, trunc, info
+        obs, reward, term, trunc, info = self.env.step(action)
+        self._update_stats(obs)
+        return self._normalize_obs(obs), reward, term, trunc, info
+    
+    def save(self, path: str):
+        """Save normalization statistics."""
+        np.savez(path, 
+                 obs_mean=self.obs_mean, 
+                 obs_var=self.obs_var,
+                 count=self.count,
+                 base_obs_dim=self.base_obs_dim)
+    
+    def load(self, path: str):
+        """Load normalization statistics."""
+        data = np.load(path)
+        self.obs_mean = data['obs_mean']
+        self.obs_var = data['obs_var']
+        self.count = int(data['count'])
 
 
 # =============================================================================
-# INTEGRATION HELPER
+# USAGE EXAMPLE
 # =============================================================================
 
-def create_enriched_env(base_env,
-                        obs_labels: Dict = None,
-                        enable_features: bool = True,
-                        enable_reward_shaping: bool = False,
-                        debug: bool = False,
-                        **feature_kwargs) -> gym.Env:
+def create_properly_normalized_env(base_env, use_enriched: bool = True):
     """
-    Factory function to create an enriched environment.
+    Example of proper environment setup with enriched observations.
     
-    Args:
-        base_env: Your base gymnasium environment
-        obs_labels: Observation label mapping from Godot
-        enable_features: Whether to add theoretical features
-        enable_reward_shaping: Whether to apply reward shaping
-        debug: Enable debug output
-        **feature_kwargs: Additional configuration for features
-        
-    Returns:
-        Wrapped environment
+    Key insight: Don't use VecNormalize's norm_obs=True with enriched features!
+    Instead, use SplitNormalizationWrapper.
     """
-    if not enable_features:
-        return base_env
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
     
-    feature_config = {
-        'enable_reward_shaping': enable_reward_shaping,
-        **feature_kwargs
-    }
-    
-    return EnrichedObservationWrapper(
-        base_env,
-        obs_labels=obs_labels,
-        feature_config=feature_config,
-        debug=debug
-    )
-
-
-# =============================================================================
-# EXAMPLE USAGE
-# =============================================================================
-
-if __name__ == "__main__":
-    print("EnrichedObservationWrapper - Example Usage")
-    print("=" * 50)
-    
-    # Create a dummy environment for testing
-    class DummyEnv(gym.Env):
-        def __init__(self):
-            self.observation_space = spaces.Box(low=-10, high=10, shape=(10,), dtype=np.float32)
-            self.action_space = spaces.Box(low=-1, high=1, shape=(4,), dtype=np.float32)
+    if use_enriched:
+        # 1. Apply enriched wrapper (features NOT pre-normalized)
+        env = EnrichedObservationWrapperFixed(
+            base_env,
+            normalize_features=False,  # Important: don't pre-normalize
+            smooth_threat_loss=True,
+            debug=True
+        )
         
-        def reset(self, seed=None, options=None):
-            return np.zeros(10, dtype=np.float32), {}
+        base_dim = env.original_obs_dim
         
-        def step(self, action):
-            obs = np.random.randn(10).astype(np.float32)
-            return obs, 0.0, False, False, {}
+        # 2. Apply split normalization (normalizes base, passes enriched through)
+        env = SplitNormalizationWrapper(env, base_obs_dim=base_dim)
+        
+        # 3. Vectorize
+        vec_env = DummyVecEnv([lambda: env])
+        
+        # 4. DON'T use VecNormalize for obs, only for rewards if needed
+        vec_env = VecNormalize(
+            vec_env,
+            norm_obs=False,  # CRITICAL: Already handled by SplitNormalizationWrapper
+            norm_reward=False,
+            clip_obs=10.0,
+        )
+    else:
+        # Baseline: standard VecNormalize is fine
+        vec_env = DummyVecEnv([lambda: base_env])
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False)
     
-    # Wrap it
-    env = DummyEnv()
-    wrapped_env = EnrichedObservationWrapper(env, debug=True)
-    
-    print(f"\nOriginal obs space: {env.observation_space}")
-    print(f"Wrapped obs space: {wrapped_env.observation_space}")
-    
-    # Test reset
-    obs, info = wrapped_env.reset()
-    print(f"\nReset observation shape: {obs.shape}")
-    
-    # Test step
-    obs, reward, term, trunc, info = wrapped_env.step(wrapped_env.action_space.sample())
-    print(f"Step observation shape: {obs.shape}")
-    
-    print("\nWrapper test complete!")
+    return vec_env

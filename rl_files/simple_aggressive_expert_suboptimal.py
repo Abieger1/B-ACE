@@ -7,15 +7,6 @@ Based on Fighter.gd baseline1 behavior:
 - Turn toward enemy using radial bearing
 - No cranking (removed for aggression)
 - No evading (removed for aggression)
-
-SWEEP WINNER PARAMETERS (d0.10-0.40_cd100_tg2.0_g0.9):
-- distance_min: 0.10
-- distance_max: 0.40  
-- fire_cooldown_steps: 100
-- engage_turn_gain: 2.0
-- engage_g_force: 0.9
-- use_aspect_check: False
-- use_offensive_factor: False
 """
 
 import numpy as np
@@ -125,18 +116,18 @@ class SimpleAggressiveExpert:
                 # NO MISSILE - close distance
                 if abs(angle_off) < 0.5:
                     # Enemy roughly ahead - turn toward them
-                    turn = np.clip(-angle_off * 2.0, -0.8, 0.8)  # Sweep winner: tg2.0
-                    g_force = 0.9  # Sweep winner: g0.9
+                    turn = np.clip(-angle_off * 1.5, -0.8, 0.8)
+                    g_force = 0.7
                 else:
                     # Enemy far off-boresight (behind/side)
                     # Turn toward HVAA to stay between HVAA and threat
                     # This prevents turning further away from the fight
                     if abs(hvaa_angle) > 0.1:
-                        turn = np.clip(hvaa_angle * 2.0, -0.8, 0.8)  # Sweep winner: tg2.0
+                        turn = np.clip(hvaa_angle * 1.5, -0.8, 0.8)
                     else:
                         # HVAA ahead, turn toward enemy
-                        turn = np.clip(-angle_off * 1.5, -0.8, 0.8)
-                    g_force = 0.9  # Sweep winner: g0.9
+                        turn = np.clip(-angle_off * 1.0, -0.8, 0.8)
+                    g_force = 0.8
             altitude = 0.1
             
             if self.debug:
@@ -145,7 +136,7 @@ class SimpleAggressiveExpert:
             # Fire decision - tighter range for better hits
             fire = 0.0
             if missiles > 0 and not missile_in_flight and self.fire_cooldown <= 0:
-                dist_ok = 0.10 < distance < 0.40  # Sweep winner: d0.10-0.40
+                dist_ok = 0.15 < distance < 0.40
                 
                 if dist_ok:
                     fire = 1.0

@@ -69,8 +69,10 @@ print(f"Using REPO_ROOT: {REPO_ROOT}")
 
 from b_ace_py.utils import load_b_ace_config
 from b_ace_py.B_ACE_GodotPettingZooWrapper import B_ACE_GodotPettingZooWrapper
-from b_ace_py.enriched_observation_wrapper import EnrichedObservationWrapper
+from b_ace_py.enriched_observation_wrapper_ablation import EnrichedObservationWrapper, SplitNormalizationWrapper
 from expert_alignment_wrapper import ExpertAlignmentWrapper, create_alignment_decay_fn, get_default_enriched_obs_indices
+from aggressive_hunter_fixed import AggressiveHunterFixed, get_default_obs_indices
+from expert_action_blending_wrapper import ExpertActionBlendingWrapper, create_alpha_decay_fn
 from sustained_turn_penalty import SustainedTurnPenaltySimple
 from hvaa_destruction_penalty import HVAADestructionPenalty
 from rollback_eval_callback import RollbackEvaluationCallbackTopK
@@ -1406,7 +1408,7 @@ def _parse_args():
     parser.add_argument(
         "--final-entropy-coef",
         type=float,
-        default=0.001,
+        default=0.005,
         help="Final entropy coefficient after decay."
     )
     
@@ -1535,10 +1537,98 @@ def _parse_args():
     #    action="store_false",
     #    help="Disable enriched observations (use baseline 22 dims)"
     #)
+    # Individual feature toggles for enriched observations
+    # Geometry features (Category A)
+    parser.add_argument(
+        "--enable-apollonius", dest="enable_apollonius", action="store_true", default=True,
+        help="Enable Apollonius circle geometry features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-apollonius", dest="enable_apollonius", action="store_false",
+        help="Disable Apollonius circle geometry features"
+    )
+    
+    # Engagement features (Category B)
+    parser.add_argument(
+        "--enable-bez", dest="enable_bez", action="store_true", default=True,
+        help="Enable Basic Engagement Zone features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-bez", dest="enable_bez", action="store_false",
+        help="Disable Basic Engagement Zone features"
+    )
+    
+    parser.add_argument(
+        "--enable-dmc", dest="enable_dmc", action="store_true", default=True,
+        help="Enable Dynamic Maneuvering Cue features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-dmc", dest="enable_dmc", action="store_false",
+        help="Disable Dynamic Maneuvering Cue features"
+    )
+    
+    parser.add_argument(
+        "--enable-offense-wez", dest="enable_offense_wez", action="store_true", default=True,
+        help="Enable offensive Weapon Engagement Zone features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-offense-wez", dest="enable_offense_wez", action="store_false",
+        help="Disable offensive Weapon Engagement Zone features"
+    )
+    
+    parser.add_argument(
+        "--enable-offense-ttc", dest="enable_offense_ttc", action="store_true", default=True,
+        help="Enable offensive Time-To-Capture features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-offense-ttc", dest="enable_offense_ttc", action="store_false",
+        help="Disable offensive Time-To-Capture features"
+    )
+    
+    # Multi-threat and HVAA features (typically disabled by default)
+    parser.add_argument(
+        "--enable-multi-threat", dest="enable_multi_threat", action="store_true", default=False,
+        help="Enable multi-threat tracking features (default: disabled)"
+    )
+    parser.add_argument(
+        "--disable-multi-threat", dest="enable_multi_threat", action="store_false",
+        help="Disable multi-threat tracking features"
+    )
+    
+    parser.add_argument(
+        "--enable-hvaa-escort", dest="enable_hvaa_escort", action="store_true", default=False,
+        help="Enable HVAA escort-specific features (default: disabled)"
+    )
+    parser.add_argument(
+        "--disable-hvaa-escort", dest="enable_hvaa_escort", action="store_false",
+        help="Disable HVAA escort-specific features"
+    )
+
     parser.add_argument("--expert-alignment", action="store_true", default=False)
-    parser.add_argument("--alignment-coef", type=float, default=0.1)
+    parser.add_argument("--alignment-coef", type=float, default=0.002)
     parser.add_argument("--alignment-decay-start", type=int, default=500_000)
     parser.add_argument("--alignment-decay-end", type=int, default=2_000_000)
+    
+    # Expert Action Blending (Configuration 3)
+    parser.add_argument("--expert-blending", action="store_true", default=False,
+                        help="Enable expert action blending (Config 3: blended action execution)")
+    parser.add_argument("--blend-initial-alpha", type=float, default=0.8,
+                        help="Initial alpha (expert influence) for blending. 1.0=all expert, 0.0=all PPO")
+    parser.add_argument("--blend-final-alpha", type=float, default=0.05,
+                        help="Final alpha after decay completes")
+    parser.add_argument("--blend-decay-start", type=int, default=500_000,
+                        help="Timestep to begin alpha decay (hold initial_alpha before this)")
+    parser.add_argument("--blend-decay-end", type=int, default=5_000_000,
+                        help="Timestep to reach final alpha")
+    parser.add_argument("--blend-decay-type", type=str, default='linear',
+                        choices=['linear', 'exponential', 'cosine'],
+                        help="Type of alpha decay schedule")
+    parser.add_argument("--blend-fire-mode", type=str, default='gate',
+                        choices=['ppo', 'expert', 'blend', 'gate', 'or'],
+                        help="How to handle fire action: gate=expert when alpha>0.3, ppo=always PPO")
+    parser.add_argument("--blend-debug", action="store_true", default=False,
+                        help="Enable debug output for blending wrapper")
+    
     # Set default to False (baseline observations by default)
     parser.set_defaults(use_enriched_obs=False)
     
@@ -1810,42 +1900,26 @@ def main():
 
             # === ENRICHED OBSERVATIONS (OPTIONAL) ===
             if args.use_enriched_obs:
-                # Map ablation config to human-readable category names
-                config_to_categories = {
-                    'all': 'A+B+C (all features)',
-                    'none': 'No features (enriched wrapper active but 0 features)',
-                    'geometry_only': 'A only (GEOMETRY)',
-                    'engagement_only': 'B only (ENGAGEMENT)',
-                    'range_limited_only': 'C only (RANGE_LIMITED)',
-                    'geometry_engagement': 'A+B (GEOMETRY + ENGAGEMENT)',
-                    'geometry_range': 'A+C (GEOMETRY + RANGE_LIMITED)',
-                    'engagement_range': 'B+C (ENGAGEMENT + RANGE_LIMITED)',
-                }
-                
-                print("\n" + "="*60)
-                print("USING ENRICHED OBSERVATIONS")
-                print(f"  Ablation Config: {args.ablation_config}")
-                print(f"  Categories: {config_to_categories.get(args.ablation_config, 'unknown')}")
-                print("  Legend:")
-                print("    [A] GEOMETRY     = Apollonius circle + ATDDG (Weintraub 2020)")
-                print("    [B] ENGAGEMENT   = BEZ + DMC + WEZ (Von Moll 2024)")
-                print("    [C] RANGE_LIMITED = Escape heading + capture prob (Weintraub 2023)")
-                print("="*60 + "\n")
-                
+                # Apply enriched observation wrapper with ablation config
+                # This adds theoretical features (Apollonius, BEZ, DMC, ATDDG, Range-Limited)
                 e = EnrichedObservationWrapper(
                     e,
-                    obs_labels=None,
-                    feature_config={
-                        'pursuer_speed': 1.0,
-                        'evader_speed': 1.0,
-                        'capture_radius': 0.01,
-                        'pursuer_range': 0.5,
-                        'normalize_distance': 1.0,
-                    },
-                    #Testing Old enriched observation features
-                    #ablation_config=args.ablation_config,
+                    ablation_config=args.ablation_config,  # 'all', 'geometry_only', etc.
+                    normalize_features=False,   # CRITICAL: Avoid double-normalization with VecNormalize
+                    smooth_threat_loss=True,    # CRITICAL: Smooth decay instead of hard padding
                     debug=False
                 )
+                
+                # Store base observation dimension for split normalization
+                base_obs_dim = e.original_obs_dim
+                print(f"  [Enriched Obs] Config: {args.ablation_config}")
+                print(f"  [Enriched Obs] Base dim: {base_obs_dim}, Enriched dim: {e.observation_space.shape[0]}")
+                print(f"  [Enriched Obs] Added features: {e.num_added_features}")
+                
+                # Apply split normalization: normalizes base features, passes enriched features through unchanged
+                # This REPLACES VecNormalize's observation normalization for enriched observations
+                e = SplitNormalizationWrapper(e, base_obs_dim=base_obs_dim)
+                print(f"  [Split Normalization] Applied - base features normalized, enriched features passed through")
             else:
                 print("\n" + "="*60)
                 print("USING BASELINE OBSERVATIONS (NO THEORETICAL FEATURES)")
@@ -1868,7 +1942,7 @@ def main():
             e = MissionTempoShapingPerStep(
                 e,
                 penalty_per_step=-0.003,  # While red alive
-                bonus_per_step=0.005,     # After red killed
+                bonus_per_step=0.006,     # After red killed
                 require_hvaa_alive=True,
             )
 
@@ -1894,7 +1968,7 @@ def main():
                 range_idx=17,
                 track_idx=26,
                 track_loss_penalty=-0.3,
-                k_close=30.0,
+                k_close=40.0,
                 asymmetry_ratio=2.0,
                 clip_delta=0.02,            # Filter large single-step deltas
                 max_valid_delta=0.05,       # Ignore anomalous jumps (target destroyed/respawned)
@@ -1904,38 +1978,76 @@ def main():
             e = FireCooldownWrapper(
                 e,
                 fire_idx=3,
-                cd_start=55,
+                cd_start=70,
                 cd_end=120,
                 cd_hold=10_000,
-                cd_steps=5_000_000,
-                rising_edge_after=1_500_000
+                cd_steps=5_000_000
+                #rising_edge_after=1_500_000
             )
             
-            e = HVAASurvivalEveryNStepsBonus(e, every_n_steps=50, bonus=0.02)
+            e = HVAASurvivalEveryNStepsBonus(e, every_n_steps=25, bonus=0.01)
             # DISABLED: Large instant penalty creates high variance and credit assignment issues
             # The survival bonus provides dense positive signal instead
             # e = HVAADestructionPenalty(e, penalty=-15.0)
 
-            # === EXPERT ALIGNMENT (ONLY WITH ENRICHED OBS) ===
-            if args.expert_alignment:
-                if not args.use_enriched_obs:
-                    print("  WARNING: Expert alignment requires enriched observations!")
-                    print("    Skipping ExpertAlignmentWrapper for baseline run.")
-                else:
-                    expert = AggressiveExpert(fire_threshold=0.50, aspect_limit_deg=30.0)
-                    obs_indices = get_default_enriched_obs_indices()
-                    alignment_decay = create_alignment_decay_fn(
-                        decay_start=args.alignment_decay_start,
-                        decay_end=args.alignment_decay_end,
-                        final_multiplier=0.3,
-                    )
-                    e = ExpertAlignmentWrapper(
-                        e, expert=expert, obs_indices=obs_indices,
-                        alignment_coef=args.alignment_coef,
-                        action_weights=np.array([1.0, 0.3, 0.6, 0.5]),
-                        decay_fn=alignment_decay,
-                    )
-                    print(f"✓ Expert alignment wrapper added")
+            # === EXPERT ALIGNMENT (TRAINING ONLY) ===
+            if args.expert_alignment and not is_eval:
+                expert = AggressiveHunterFixed(debug=False)
+                obs_indices = get_default_obs_indices()  # 27-dim base indices for expert
+                alignment_decay = create_alignment_decay_fn(
+                    decay_start=args.alignment_decay_start,
+                    decay_end=args.alignment_decay_end,
+                    final_multiplier=0.3,
+                )
+                e = ExpertAlignmentWrapper(
+                    e, expert=expert, obs_indices=obs_indices,
+                    alignment_coef=args.alignment_coef,
+                    action_weights=np.array([1.0, 0.3, 0.6, 0.5]),
+                    decay_fn=alignment_decay,
+                )
+                print(f"✓ Expert alignment wrapper added (TRAINING ONLY)")
+            elif args.expert_alignment and is_eval:
+                print(f"ℹ Expert alignment SKIPPED for evaluation environment")
+
+            # === EXPERT ACTION BLENDING (TRAINING ONLY - Configuration 3) ===
+            # NOTE: This is different from expert alignment (Config 2)!
+            # - Config 2 (alignment): Agent executes ITS OWN action, gets reward bonus for matching expert
+            # - Config 3 (blending): Agent's action is BLENDED with expert before execution
+            if args.expert_blending and not is_eval:
+                # Sanity check: don't use both approaches simultaneously
+                if args.expert_alignment:
+                    print("⚠ WARNING: Both --expert-alignment and --expert-blending are enabled!")
+                    print("   These are different approaches and should not be combined.")
+                    print("   Proceeding with both, but results may be unpredictable.")
+                
+                expert_blend = AggressiveHunterFixed(debug=args.blend_debug)
+                obs_indices_blend = get_default_obs_indices()  # 27-dim base indices for expert
+                
+                alpha_decay = create_alpha_decay_fn(
+                    initial_alpha=args.blend_initial_alpha,
+                    final_alpha=args.blend_final_alpha,
+                    decay_start=args.blend_decay_start,
+                    decay_end=args.blend_decay_end,
+                    decay_type=args.blend_decay_type,
+                )
+                
+                e = ExpertActionBlendingWrapper(
+                    e,
+                    expert=expert_blend,
+                    obs_indices=obs_indices_blend,
+                    alpha_fn=alpha_decay,
+                    blend_dims=[0, 1, 2],  # Blend turn, altitude, g_force (fire handled separately)
+                    fire_blend_mode=args.blend_fire_mode,
+                    fire_gate_threshold=0.3,
+                    debug=args.blend_debug,
+                )
+                print(f"✓ Expert action blending wrapper added (TRAINING ONLY)")
+                print(f"   Blending formula: action = α×expert + (1-α)×PPO")
+                print(f"   Alpha schedule: {args.blend_initial_alpha} → {args.blend_final_alpha} ({args.blend_decay_type})")
+                print(f"   Decay window: {args.blend_decay_start:,} → {args.blend_decay_end:,} steps")
+                print(f"   Fire mode: {args.blend_fire_mode}")
+            elif args.expert_blending and is_eval:
+                print(f"ℹ Expert action blending SKIPPED for evaluation environment")
 
             # === DEBUG OUTPUT ===
             obs, _ = e.reset()
@@ -1976,13 +2088,27 @@ def main():
 
     vec_env = DummyVecEnv([make_env(log_dir.as_posix(), args.seed)])
 
-    vec_env = VecNormalize(
-        vec_env,
-        norm_obs=True,
-        norm_reward=False,
-        clip_obs=10.0,
-        clip_reward=10.0,
-    )
+    # CRITICAL: When using enriched observations, SplitNormalizationWrapper handles
+    # observation normalization. VecNormalize should NOT re-normalize observations.
+    # For baseline observations, VecNormalize handles all normalization.
+    if args.use_enriched_obs:
+        print("\n[VecNormalize] norm_obs=False (handled by SplitNormalizationWrapper)")
+        vec_env = VecNormalize(
+            vec_env,
+            norm_obs=False,   # CRITICAL: Already normalized by SplitNormalizationWrapper
+            norm_reward=False,
+            clip_obs=10.0,
+            clip_reward=10.0,
+        )
+    else:
+        print("\n[VecNormalize] norm_obs=True (baseline observations)")
+        vec_env = VecNormalize(
+            vec_env,
+            norm_obs=True,    # Standard normalization for baseline
+            norm_reward=False,
+            clip_obs=10.0,
+            clip_reward=10.0,
+        )
     print_wrapper_stack(vec_env, name="TRAIN vec_env (after VecNormalize)")
 
     print(f"[NEW***DEBUG] vec_env.observation_space: {vec_env.observation_space}")
@@ -2079,21 +2205,40 @@ def main():
 
     
     # Wrap with VecNormalize but set training=False
-    eval_env = VecNormalize(
-        eval_env,
-        norm_obs=True,
-        norm_reward=False,  # Don't normalize rewards during eval
-        clip_obs=10.0,
-        clip_reward=10.0,
-        training=False,  # Important: don't update normalization stats during eval
-    )
+    # CRITICAL: Must match training env's norm_obs setting
+    if args.use_enriched_obs:
+        print("\n[Eval VecNormalize] norm_obs=False (matching training - handled by SplitNormalizationWrapper)")
+        eval_env = VecNormalize(
+            eval_env,
+            norm_obs=False,   # CRITICAL: Match training env - SplitNormalizationWrapper handles it
+            norm_reward=False,  # Don't normalize rewards during eval
+            clip_obs=10.0,
+            clip_reward=10.0,
+            training=False,  # Important: don't update normalization stats during eval
+        )
+    else:
+        print("\n[Eval VecNormalize] norm_obs=True (matching training - baseline observations)")
+        eval_env = VecNormalize(
+            eval_env,
+            norm_obs=True,    # Match training env - standard normalization
+            norm_reward=False,  # Don't normalize rewards during eval
+            clip_obs=10.0,
+            clip_reward=10.0,
+            training=False,  # Important: don't update normalization stats during eval
+        )
 
     print_wrapper_stack(eval_env, name="EVAL eval_env (after VecNormalize)")
     
     # Sync normalization stats from training env to eval env
-    # This will be updated automatically during training
-    eval_env.obs_rms = vec_env.obs_rms
-    eval_env.ret_rms = vec_env.ret_rms
+    # Only sync if using norm_obs=True (when NOT using enriched observations)
+    # With enriched observations, SplitNormalizationWrapper handles normalization
+    # and VecNormalize doesn't create obs_rms
+    if hasattr(vec_env, 'obs_rms') and vec_env.obs_rms is not None:
+        eval_env.obs_rms = vec_env.obs_rms
+        print("  [Normalization] Synced obs_rms from training to eval env")
+    if hasattr(vec_env, 'ret_rms') and vec_env.ret_rms is not None:
+        eval_env.ret_rms = vec_env.ret_rms
+        print("  [Normalization] Synced ret_rms from training to eval env")
     
     print(f"✓ Evaluation environment created")
     print(f"  Eval episodes: 10")
@@ -2117,12 +2262,12 @@ def main():
         log_dir=log_dir,
         max_checkpoints=5,
         rollback_patience=6,
-        deficit_threshold=35.0,
-        min_timesteps_before_rollback=5_000_000,
+        deficit_threshold=40.0,
+        min_timesteps_before_rollback=4_000_000,
         lr_decay_factor=0.7,           # Less aggressive (was 0.5)
-        entropy_decay_factor=0.7,
+        entropy_decay_factor=0.5,
         min_lr_multiplier=0.4,
-        max_rollbacks=3,               # Limited rollbacks (was 10)
+        max_rollbacks=5,               # Limited rollbacks (was 10)
         skip_initial_eval=True,
         activation_threshold=12.0,
         freeze_vecnormalize_until_new_best=True,  # ← NEW: Permanent freeze!
@@ -2285,6 +2430,15 @@ def main():
         'n_layers': args.n_layers,
         'layer_size': args.layer_size,
         'vf_coef': args.vf_coef,
+        # Expert guidance configuration
+        'expert_alignment': args.expert_alignment,
+        'expert_blending': args.expert_blending,
+        'blend_initial_alpha': args.blend_initial_alpha if args.expert_blending else None,
+        'blend_final_alpha': args.blend_final_alpha if args.expert_blending else None,
+        'blend_decay_start': args.blend_decay_start if args.expert_blending else None,
+        'blend_decay_end': args.blend_decay_end if args.expert_blending else None,
+        'blend_decay_type': args.blend_decay_type if args.expert_blending else None,
+        'blend_fire_mode': args.blend_fire_mode if args.expert_blending else None,
     }
     
     results = {

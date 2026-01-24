@@ -229,22 +229,6 @@ class FireCooldownWrapper(gym.Wrapper):
         return obs, rew, terminated, truncated, info
 
 
-# -----------------------------
-# CRITICAL FIX: EpisodeOverTerminatorWrapper
-# This wrapper ensures Gymnasium episodes end when Godot signals episode_over
-# Without this, multiple simulation episodes get lumped together incorrectly
-# -----------------------------
-class EpisodeOverTerminatorWrapper(gym.Wrapper):
-    """Ends the Gymnasium episode when the underlying Godot sim reports episode_over."""
-    def step(self, action):
-        obs, rew, terminated, truncated, info = self.env.step(action)
-        if (not terminated) and (not truncated) and bool(info.get("episode_over", False)):
-            terminated = True
-            info = dict(info)
-            info["terminated_by_episode_over"] = True
-        return obs, rew, terminated, truncated, info
-
-
 class SingleAgentBACEEnv(gym.Env):
     """SB3-compatible single-agent wrapper."""
     metadata = {"render.modes": ["human"]}
@@ -364,24 +348,9 @@ def _resolve_env_path() -> str:
     raise FileNotFoundError(f"Could not find Godot binary")
 
 
-# -----------------------------
-# CRITICAL FIX: Robust _as_bool function
-# The original version failed to handle numpy types (np.bool_, np.integer, np.floating)
-# which caused event detection (HVAA destroyed, red killed, etc.) to fail silently
-# -----------------------------
-def _as_bool(x) -> bool:
-    """Safe boolean conversion - handles numpy types, Python types, and edge cases."""
-    try:
-        # Handle numpy bool_ explicitly (it's not isinstance of Python bool)
-        if isinstance(x, (np.bool_, bool)):
-            return bool(x)
-        # Handle numpy numeric types (np.int64, np.float32, etc.)
-        if isinstance(x, (int, float, np.integer, np.floating)):
-            return float(x) != 0.0
-        # Fallback for other types
-        return bool(x)
-    except Exception:
-        return False
+def _as_bool(v) -> bool:
+    """Safe boolean conversion - handles various types from info dict."""
+    return bool(v) if isinstance(v, bool) else (v > 0.5 if isinstance(v, (int, float)) else False)
 
 
 def _as_int(v) -> int:
@@ -412,36 +381,45 @@ def _jsonify(obj):
     return str(obj)
 
 
-def _infer_net_arch_from_state_dict(state_dict: dict, verbose: bool = True) -> List[int]:
+
+def infer_policy_kwargs_from_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Infer SB3 MlpPolicy net_arch from a saved policy state_dict.
+
+    This lets us rebuild the PPO policy with the *same* hidden-layer sizes
+    as training, so `load_state_dict()` doesn't throw size-mismatch errors.
+
+    Expected SB3 keys include:
+      - mlp_extractor.policy_net.{i}.weight
+      - mlp_extractor.value_net.{i}.weight
+      - action_net.weight / value_net.weight
     """
-    Infer the network architecture from a policy state dict.
-    
-    Looks at mlp_extractor.policy_net layer weights to determine hidden sizes.
-    e.g., policy_net.0.weight shape [512, 27] means first hidden layer has 512 units.
-    
-    Returns:
-        List of hidden layer sizes, e.g., [512, 512] or [64, 64]
-    """
-    hidden_sizes = []
-    
-    # Look for mlp_extractor.policy_net.X.weight keys (X = 0, 2, 4, ... for linear layers)
-    # The pattern is: 0=linear, 1=activation, 2=linear, 3=activation, etc.
-    layer_idx = 0
-    while True:
-        key = f"mlp_extractor.policy_net.{layer_idx}.weight"
-        if key in state_dict:
-            weight_shape = state_dict[key].shape
-            # weight shape is [out_features, in_features]
-            hidden_size = weight_shape[0]
-            hidden_sizes.append(hidden_size)
-            layer_idx += 2  # Skip activation layer
-        else:
-            break
-    
-    if verbose and hidden_sizes:
-        print(f"   → Inferred network architecture: {hidden_sizes}")
-    
-    return hidden_sizes if hidden_sizes else [64, 64]  # Default fallback
+    def _extract_layers(prefix: str) -> list[int]:
+        # SB3 stores Linear layers at even indices (0,2,4,...) with activations in between.
+        pat = re.compile(rf"^{re.escape(prefix)}\.(\d+)\.weight$")
+        items = []
+        for k, v in state_dict.items():
+            m = pat.match(k)
+            if m is None:
+                continue
+            idx = int(m.group(1))
+            try:
+                out_features, in_features = v.shape
+            except Exception:
+                continue
+            items.append((idx, int(out_features)))
+        items.sort(key=lambda t: t[0])
+        return [out for _, out in items]
+
+    pi_layers = _extract_layers("mlp_extractor.policy_net")
+    vf_layers = _extract_layers("mlp_extractor.value_net")
+
+    # Fall back to SB3 default if we can't infer (should be rare)
+    if not pi_layers:
+        pi_layers = [64, 64]
+    if not vf_layers:
+        vf_layers = [64, 64]
+
+    return {"net_arch": [dict(pi=pi_layers, vf=vf_layers)]}
 
 
 def load_model_with_pt_fallback(
@@ -500,7 +478,16 @@ def load_model_with_pt_fallback(
         if verbose:
             print(f"   → Falling back to {policy_pt_path.name}")
         
-        # Load the saved policy weights FIRST to determine architecture
+        # Create a fresh PPO model with the environment
+        # This creates the correct architecture based on the observation/action spaces
+        model = PPO(
+            policy="MlpPolicy",
+            env=env,
+            verbose=0,
+            device="cpu",
+        )
+        
+        # Load the saved policy weights
         checkpoint = torch.load(policy_pt_path, map_location="cpu", weights_only=False)
         
         # Handle different checkpoint formats
@@ -521,21 +508,15 @@ def load_model_with_pt_fallback(
         else:
             state_dict = checkpoint
         
-        # Infer network architecture from the state dict weights
-        net_arch = _infer_net_arch_from_state_dict(state_dict, verbose=verbose)
-        
-        # Create a fresh PPO model with the CORRECT architecture
-        policy_kwargs = dict(net_arch=net_arch)
-        
+        # Build a fresh PPO policy that matches the checkpoint architecture (e.g., [512,512] vs [64,64])
+        policy_kwargs = infer_policy_kwargs_from_state_dict(state_dict)
         model = PPO(
             policy="MlpPolicy",
             env=env,
+            policy_kwargs=policy_kwargs,
             verbose=0,
             device="cpu",
-            policy_kwargs=policy_kwargs,
         )
-        
-        # Now load the weights
         model.policy.load_state_dict(state_dict)
         
         if verbose:
@@ -793,10 +774,6 @@ def evaluate_model(
             
             e = FireCooldownWrapper(e, cooldown_steps=120, fire_idx=3, threshold=0.5)
             e = HVAASurvivalEveryNStepsBonus(e, every_n_steps=50, bonus=0.05)
-            # CRITICAL FIX: Add EpisodeOverTerminatorWrapper to properly end episodes
-            # when Godot signals episode_over. Without this, multiple simulation episodes
-            # get lumped together, causing incorrect metrics.
-            e = EpisodeOverTerminatorWrapper(e)
             return e
         return _thunk
 
@@ -834,7 +811,7 @@ def evaluate_model(
         
         info = infos[0] if isinstance(infos, (list, tuple)) else (infos if isinstance(infos, dict) else {})
         
-        # Track events (using fixed _as_bool that handles numpy types)
+        # Track events
         if _as_bool(info.get("hvaa_destroyed", False)) or not _as_bool(info.get("hvaa_alive", True)):
             ep_hvaa_destroyed = True
         

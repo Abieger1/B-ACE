@@ -55,7 +55,7 @@ class ExpertAlignmentWrapper(gym.Wrapper):
         env: gym.Env,
         expert: Any,
         obs_indices: Dict[str, int],
-        alignment_coef: float = 0.005,
+        alignment_coef: float = 0.1,
         action_weights: Optional[np.ndarray] = None,
         decay_fn: Optional[Callable[[int], float]] = None,
         debug: bool = False,
@@ -327,7 +327,7 @@ class ExpertAlignmentWrapper(gym.Wrapper):
 
 
 def create_alignment_decay_fn(
-    decay_start: int = 500_000,
+    decay_start: int =400_000,
     decay_end: int = 2_000_000,
     final_multiplier: float = 0.3,
 ) -> Callable[[int], float]:

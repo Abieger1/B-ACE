@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
 """
-train_bace_config3.py - Scenario 1, Configuration 3: Expert Action Blending
+train_sb3_bace_with_eval_checkpoints.py
 
-Training script that BLENDS PPO agent actions with expert actions before execution.
-Unlike Config 2 (alignment reward), here the executed action is modified.
-
-Key features:
-- Action blending: blended = alpha * expert + (1 - alpha) * PPO
-- Alpha decay: Starts with high expert influence, decays to PPO dominance
-- Agent learns from expert-guided trajectories early, takes control later
-- Enriched observations (47 dims) with pursuit-evasion domain knowledge
-
-Key differences from Config 2:
-- Config 2: Agent executes ITS OWN action, gets bonus reward for matching expert
-- Config 3: Agent's action is BLENDED with expert before execution
+Enhanced Stable-Baselines3 PPO training script for B-ACE with:
+- Learning rate and entropy decay
+- Multiple seed support
+- EVALUATION-BASED checkpointing (NEW!)
+- Runs 20 evaluation episodes every 250k steps
+- Saves best model based on deterministic evaluation performance
+- Metrics collection for confidence interval analysis
+- JSON results export for later comparison
+- ENRICHED OBSERVATIONS BY DEFAULT (47 dims with domain knowledge)
 
 Usage:
-    # Run with expert blending (Configuration 3)
-    python train_bace_config3.py --expert-blending --seed 42
+    # Enriched observations (DEFAULT - 47 dims)
+    python rl_files/train_sb3_bace_with_eval_checkpoints_fixed.py --seed 42
     
-    # With custom alpha parameters
-    python train_bace_config3.py --expert-blending --initial-alpha 0.7 --final-alpha 0.1 --seed 42
-    
-    # Without expert blending (baseline)
-    python train_bace_config3.py --seed 42
+    # Baseline observations (22 dims)
+    python train_sb3_bace_with_eval_checkpoints.py --no-enriched-obs --seed 42
 """
 
 import argparse
@@ -75,9 +69,15 @@ print(f"Using REPO_ROOT: {REPO_ROOT}")
 
 from b_ace_py.utils import load_b_ace_config
 from b_ace_py.B_ACE_GodotPettingZooWrapper import B_ACE_GodotPettingZooWrapper
-from b_ace_py.enriched_observation_wrapper import EnrichedObservationWrapper
-from expert_action_blending_wrapper import ExpertActionBlendingWrapper, create_alpha_decay_fn
-from simple_aggressive_expert import SimpleAggressiveExpert, get_default_obs_indices
+from b_ace_py.enriched_observation_wrapper_ablation import EnrichedObservationWrapper, SplitNormalizationWrapper
+from expert_alignment_wrapper import ExpertAlignmentWrapper, create_alignment_decay_fn, get_default_enriched_obs_indices
+from aggressive_hunter_fixed import AggressiveHunterFixed, get_default_obs_indices
+from sustained_turn_penalty import SustainedTurnPenaltySimple
+from hvaa_destruction_penalty import HVAADestructionPenalty
+from rollback_eval_callback import RollbackEvaluationCallbackTopK
+from track_aware_shaping import CombinedTrackAwareShaping
+from mission_tempo_shaping_perstep import MissionTempoShapingPerStep
+from reward_breakdown_logger import RewardBreakdownLogger, CompactRewardLogger
 # from b_ace_py.reward_shaping_wrapper import RewardShapingWrapper, RewardShapingConfig  # DISABLED (no reward shaping wrapper)
 try:
     from reward_component_eval_callback import RewardComponentEvalCallback
@@ -122,6 +122,29 @@ class HVAASurvivalEveryNStepsBonus(gym.Wrapper):
 
         self._t += 1
         return obs, rew, terminated, truncated, info
+
+class KillRewardWrapper(gym.Wrapper):
+    """Add reward when red_killed_event FIRST becomes True."""
+    def __init__(self, env, kill_reward: float = 10.0):
+        super().__init__(env)
+        self.kill_reward = kill_reward
+        self._already_awarded = False  # Track if we already gave the reward
+    
+    def reset(self, **kwargs):
+        self._already_awarded = False  # Reset on new episode
+        return self.env.reset(**kwargs)
+    
+    def step(self, action):
+        obs, reward, term, trunc, info = self.env.step(action)
+        
+        # Only award ONCE per episode when red_killed_event first becomes True
+        if info.get("red_killed_event", False) and not self._already_awarded:
+            reward += self.kill_reward
+            self._already_awarded = True
+            print(f"[KILL REWARD] +{self.kill_reward} for killing red!")
+        
+        return obs, reward, term, trunc, info
+
 
 class ActionSmoothnessPenalty(gym.Wrapper):
     """
@@ -197,36 +220,77 @@ class ActionSmoothnessPenalty(gym.Wrapper):
         return obs, rew, terminated, truncated, info
     
 class RangeClosingShaping(gym.Wrapper):
-    def __init__(self, env, range_idx: int, track_idx: int = 7, k: float = 0.02, clip_delta: float = 0.02):
+    def __init__(self, env, range_idx: int, track_idx: int = 7, 
+                 k: float = 30.0, clip_delta: float = 0.02,
+                 max_valid_delta: float = 0.05):  # NEW: filter threshold
         super().__init__(env)
         self.range_idx = int(range_idx)
         self.track_idx = int(track_idx)
         self.k = float(k)
         self.clip_delta = float(clip_delta)
+        self.max_valid_delta = float(max_valid_delta)  # Ignore deltas larger than this
         self.prev_range = None
-
+        
+        # Diagnostics
+        self._delta_history = []
+        self._shaping_history = []
+        self._step_count = 0
+        self._anomaly_count = 0
+        
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self.prev_range = float(obs[self.range_idx])
+        
+        # Print diagnostics every reset
+        #if self._delta_history:
+        #    deltas = np.array(self._delta_history)
+        #    shapings = np.array(self._shaping_history)
+        #    print(f"\n[RANGE SHAPING DIAGNOSTICS]")
+        #    print(f"  Steps: {self._step_count}, Tracked: {len(deltas)}, Anomalies filtered: {self._anomaly_count}")
+        #   if len(deltas) > 0:
+        #        print(f"  Delta - mean: {np.mean(deltas):.6f}, std: {np.std(deltas):.6f}")
+        #        print(f"  Delta - min: {np.min(deltas):.6f}, max: {np.max(deltas):.6f}")
+        #        print(f"  Shaping - total: {np.sum(shapings):.4f}, mean/step: {np.mean(shapings):.6f}")
+        #        print(f"  Positive shaping steps: {np.sum(shapings > 0)}/{len(shapings)}")
+        
+        self._delta_history = []
+        self._shaping_history = []
+        self._step_count = 0
+        self._anomaly_count = 0
+        
         return obs, info
-
+        
     def step(self, action):
         obs, rew, terminated, truncated, info = self.env.step(action)
-
         track = float(obs[self.track_idx]) > 0.5
         shaping = 0.0
+        
+        self._step_count += 1
+        
         if track and self.prev_range is not None:
             cur_r = float(obs[self.range_idx])
-            delta = float(self.prev_range - cur_r)  # positive if closing
-            delta = float(np.clip(delta, -self.clip_delta, self.clip_delta))
-            shaping = self.k * delta
-            rew = float(rew) + shaping
-            self.prev_range = cur_r
+            raw_delta = float(self.prev_range - cur_r)  # positive if closing
+            
+            # Filter out anomalous deltas (target lost, destroyed, etc.)
+            if abs(raw_delta) > self.max_valid_delta:
+                self._anomaly_count += 1
+                # Don't apply shaping, but do update prev_range
+                self.prev_range = cur_r
+            else:
+                # Normal delta - apply shaping
+                delta = float(np.clip(raw_delta, -self.clip_delta, self.clip_delta))
+                shaping = self.k * delta
+                rew = float(rew) + shaping
+                self.prev_range = cur_r
+                
+                # Track for diagnostics
+                #self._delta_history.append(raw_delta)
+                #self._shaping_history.append(shaping)
         else:
-            # if no track, still update prev_range so it stays current
             self.prev_range = float(obs[self.range_idx])
-
+            
         info["range_close_shaping"] = float(shaping)
+        
         return obs, rew, terminated, truncated, info
 
 
@@ -836,6 +900,14 @@ class MetricsCollectionCallback(BaseCallback):
         self.recent_rewards = []
 
     def _on_step(self) -> bool:
+        # ---- 0) UPDATE GLOBAL STEP FOR SCHEDULED WRAPPERS ----
+        # This is CRITICAL for FireCooldownWrapper, ActionSmoothnessPenalty, etc.
+        # Without this, _global_step stays at 0 and schedules don't progress!
+        try:
+            self.model.get_env().env_method("set_global_step", int(self.num_timesteps))
+        except Exception:
+            pass  # Silently ignore if method doesn't exist
+        
         # ---- 1) Update schedules every step ----
         # progress_remaining is used by SB3 schedules (1 -> 0)
         progress_remaining = 1.0 - (self.num_timesteps / self.model._total_timesteps)
@@ -977,10 +1049,11 @@ class EvaluationBasedCheckpointCallback(BaseCallback):
         self,
         eval_env: DummyVecEnv,
         eval_freq: int = 75000,
-        n_eval_episodes: int = 10, #EVALUATION EPISODES
+        n_eval_episodes: int = 15, #EVALUATION EPISODES
         log_dir: Path = None,
         verbose: int = 1,
         deterministic: bool = True,
+        skip_initial_eval: bool = True,
     ):
         super().__init__(verbose)
         self.eval_env = eval_env
@@ -988,6 +1061,7 @@ class EvaluationBasedCheckpointCallback(BaseCallback):
         self.n_eval_episodes = n_eval_episodes
         self.log_dir = Path(log_dir) if log_dir else Path(".")
         self.deterministic = deterministic
+        self.skip_initial_eval = skip_initial_eval
         
         # Best model tracking
         self.best_mean_reward = -np.inf
@@ -1076,6 +1150,13 @@ class EvaluationBasedCheckpointCallback(BaseCallback):
         """
         Run an initial evaluation at timestep 0 so the learning curve starts at 0.
         """
+        if self.skip_initial_eval:
+            if self.verbose > 0:
+                print(f"\n{'='*60}")
+                print(f"⏭️  SKIPPING INITIAL EVALUATION (skip_initial_eval=True)")
+                print(f"{'='*60}\n")
+            return
+        
         if self.verbose > 0:
             print(f"\n{'='*60}")
             print(f"🔍 INITIAL EVALUATION at 0 steps")
@@ -1306,13 +1387,13 @@ def _parse_args():
     parser.add_argument(
         "--initial-learning-rate",
         type=float,
-        default=0.000258221042696745,
+        default=0.000258,
         help="Initial learning rate."
     )
     parser.add_argument(
         "--final-learning-rate",
         type=float,
-        default=0.000034963,
+        default=0.00001,
         help="Final learning rate after decay."
     )
     
@@ -1320,13 +1401,13 @@ def _parse_args():
     parser.add_argument(
         "--initial-entropy-coef",
         type=float,
-        default=0.0450525120114811,
+        default=0.051,
         help="Initial entropy coefficient."
     )
     parser.add_argument(
         "--final-entropy-coef",
         type=float,
-        default=0.0254305724354894,
+        default=0.005,
         help="Final entropy coefficient after decay."
     )
     
@@ -1362,13 +1443,13 @@ def _parse_args():
     parser.add_argument(
         "--gae-lambda",
         type=float,
-        default=0.911539975010891,
+        default=0.920664477208517,
         help="GAE lambda."
     )
     parser.add_argument(
         "--clip-eps",
         type=float,
-        default=0.2,
+        default=0.197991384633053,
         help="PPO clip range."
     )
 
@@ -1376,7 +1457,7 @@ def _parse_args():
     parser.add_argument(
         "--vf-coef",
         type=float,
-        default=0.772813953325389,
+        default=0.7728139,
         help="Value loss coefficient."
     )
     parser.add_argument(
@@ -1394,7 +1475,7 @@ def _parse_args():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=2,
+        default=8,
         help="Number of epochs per PPO update."
     )
     parser.add_argument(
@@ -1429,32 +1510,105 @@ def _parse_args():
     parser.add_argument(
         "--use-enriched-obs",
         action="store_true",
-        help="Enable enriched observations with pursuit-evasion heuristics (47 dims)"
+        default=False,
+        help="Enable enriched observations with pursuit-evasion heuristics"
     )
     parser.add_argument(
-        "--no-enriched-obs",
-        dest="use_enriched_obs",
-        action="store_false",
-        help="Disable enriched observations (use baseline 22 dims)"
+        "--ablation-config",
+        type=str,
+        default="all",
+        choices=['all', 'none', 'geometry_only', 'engagement_only', 'range_limited_only',
+                 'geometry_engagement', 'geometry_range', 'engagement_range'],
+        help="""Ablation config for feature categories (only applies when --use-enriched-obs is set):
+  all                 = A+B+C (GEOMETRY + ENGAGEMENT + RANGE_LIMITED)
+  none                = No theoretical features (raw obs only)
+  geometry_only       = A only (Apollonius + ATDDG)
+  engagement_only     = B only (BEZ + DMC + WEZ)
+  range_limited_only  = C only (Critical escape + capture probability)
+  geometry_engagement = A+B (GEOMETRY + ENGAGEMENT)
+  geometry_range      = A+C (GEOMETRY + RANGE_LIMITED)
+  engagement_range    = B+C (ENGAGEMENT + RANGE_LIMITED)
+"""
     )
-    parser.add_argument("--expert-blending", action="store_true", default=False,
-                        help="Enable expert action blending (Config 3)")
-    parser.add_argument("--initial-alpha", type=float, default=0.7,
-                        help="Initial blending alpha (1=all expert, 0=all PPO)")
-    parser.add_argument("--final-alpha", type=float, default=0.1,
-                        help="Final blending alpha after decay")
-    parser.add_argument("--alpha-decay-start", type=int, default=500_000,
-                        help="Step to start alpha decay")
-    parser.add_argument("--alpha-decay-end", type=int, default=4_000_000,
-                        help="Step to finish alpha decay")
-    parser.add_argument("--alpha-decay-type", type=str, default='linear',
-                        choices=['linear', 'exponential', 'cosine'],
-                        help="Type of alpha decay schedule")
-    parser.add_argument("--fire-blend-mode", type=str, default='gate',
-                        choices=['ppo', 'expert', 'blend', 'gate', 'or'],
-                        help="How to handle fire action blending")
-    # Set default to True (enriched observations enabled by default)
-    parser.set_defaults(use_enriched_obs=True)
+    #parser.add_argument(
+    #    "--no-enriched-obs",
+    #    dest="use_enriched_obs",
+    #    action="store_false",
+    #    help="Disable enriched observations (use baseline 22 dims)"
+    #)
+    # Individual feature toggles for enriched observations
+    # Geometry features (Category A)
+    parser.add_argument(
+        "--enable-apollonius", dest="enable_apollonius", action="store_true", default=True,
+        help="Enable Apollonius circle geometry features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-apollonius", dest="enable_apollonius", action="store_false",
+        help="Disable Apollonius circle geometry features"
+    )
+    
+    # Engagement features (Category B)
+    parser.add_argument(
+        "--enable-bez", dest="enable_bez", action="store_true", default=True,
+        help="Enable Basic Engagement Zone features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-bez", dest="enable_bez", action="store_false",
+        help="Disable Basic Engagement Zone features"
+    )
+    
+    parser.add_argument(
+        "--enable-dmc", dest="enable_dmc", action="store_true", default=True,
+        help="Enable Dynamic Maneuvering Cue features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-dmc", dest="enable_dmc", action="store_false",
+        help="Disable Dynamic Maneuvering Cue features"
+    )
+    
+    parser.add_argument(
+        "--enable-offense-wez", dest="enable_offense_wez", action="store_true", default=True,
+        help="Enable offensive Weapon Engagement Zone features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-offense-wez", dest="enable_offense_wez", action="store_false",
+        help="Disable offensive Weapon Engagement Zone features"
+    )
+    
+    parser.add_argument(
+        "--enable-offense-ttc", dest="enable_offense_ttc", action="store_true", default=True,
+        help="Enable offensive Time-To-Capture features (default: enabled)"
+    )
+    parser.add_argument(
+        "--disable-offense-ttc", dest="enable_offense_ttc", action="store_false",
+        help="Disable offensive Time-To-Capture features"
+    )
+    
+    # Multi-threat and HVAA features (typically disabled by default)
+    parser.add_argument(
+        "--enable-multi-threat", dest="enable_multi_threat", action="store_true", default=False,
+        help="Enable multi-threat tracking features (default: disabled)"
+    )
+    parser.add_argument(
+        "--disable-multi-threat", dest="enable_multi_threat", action="store_false",
+        help="Disable multi-threat tracking features"
+    )
+    
+    parser.add_argument(
+        "--enable-hvaa-escort", dest="enable_hvaa_escort", action="store_true", default=False,
+        help="Enable HVAA escort-specific features (default: disabled)"
+    )
+    parser.add_argument(
+        "--disable-hvaa-escort", dest="enable_hvaa_escort", action="store_false",
+        help="Disable HVAA escort-specific features"
+    )
+
+    parser.add_argument("--expert-alignment", action="store_true", default=False)
+    parser.add_argument("--alignment-coef", type=float, default=0.002)
+    parser.add_argument("--alignment-decay-start", type=int, default=500_000)
+    parser.add_argument("--alignment-decay-end", type=int, default=2_000_000)
+    # Set default to False (baseline observations by default)
+    parser.set_defaults(use_enriched_obs=False)
     
     return parser.parse_args()
 
@@ -1618,6 +1772,13 @@ class SingleAgentBACEEnv(gym.Env):
         else:
             truncated = bool(trunc_dict)
 
+        # === DEBUG: TERMINATION SIGNAL TRACE ===
+        if terminated or truncated:
+            print(f"[SINGLE-AGENT] step={self._elapsed_steps} terminated={terminated} truncated={truncated} "
+                  f"raw_term={term_dict} raw_trunc={trunc_dict}")
+        # === END DEBUG ===
+
+
         if self._elapsed_steps >= self._max_episode_steps and not terminated:
             truncated = True
 
@@ -1712,219 +1873,180 @@ def main():
             e = SingleAgentBACEEnv(
                 bace_config=B_ACE_config,
                 controlled_agent_id="agent_0",
-                max_episode_steps=14000,
+                max_episode_steps=13_500,
             )
-            
-            # DEFAULT: Enriched observations with pursuit-evasion heuristics (47 dims)
-            # Use --no-enriched-obs flag to disable and get baseline (22 dims)
+
+            # === ENRICHED OBSERVATIONS (OPTIONAL) ===
             if args.use_enriched_obs:
-                print("\n" + "="*60)
-                print("USING ENRICHED OBSERVATIONS (DEFAULT)")
-                print("="*60 + "\n")
-                
+                # Apply enriched observation wrapper with ablation config
+                # This adds theoretical features (Apollonius, BEZ, DMC, ATDDG, Range-Limited)
                 e = EnrichedObservationWrapper(
                     e,
-                    obs_labels=None,  # Not needed anymore - we use indices directly
-                    feature_config={
-                        'pursuer_speed': 1.0,       # Normalized speed
-                        'evader_speed': 1.0,        # Normalized speed
-                        'capture_radius': 0.01,     # Small in normalized space
-                        'pursuer_range': 0.5,       # Will use Godot's missile ranges
-                        'normalize_distance': 1.0,  # Already normalized
-                        'enable_apollonius': True,
-                        'enable_bez': True,
-                        'enable_dmc': True,
-                        'enable_multi_threat': False,
-                        'enable_hvaa_escort': False,
-                        'enable_offense_wez': True,
-                        'enable_offense_ttc': True,
-                        'enable_reward_shaping': False,  # This is the old shaping (B-ACE shaping)
-                    },
-                    debug=False  # Set True initially to verify features
+                    ablation_config=args.ablation_config,  # 'all', 'geometry_only', etc.
+                    normalize_features=False,   # CRITICAL: Avoid double-normalization with VecNormalize
+                    smooth_threat_loss=True,    # CRITICAL: Smooth decay instead of hard padding
+                    debug=False
                 )
-
-                e = HeadingRateLimitWrapper(e, hdg_idx=0, max_delta=0.15)
-
-                e = ActionSmoothnessPenalty(
-                    e,
-                    hdg_idx=0,
-                    jerk_start=0.0, jerk_end=0.0025,
-                    mag_start=0.0,  mag_end=0.006,
-                    hold_steps=800_000,
-                    anneal_steps=4_500_000)
-                e = RangeClosingShaping(e, range_idx=17, track_idx=26, k=0.02, clip_delta=0.02)
-                e = FireCooldownWrapper(
-                    e,
-                    fire_idx=3,
-                    cd_start=20,
-                    cd_end=240,
-                    cd_hold=300_000,
-                    cd_steps=4_000_000,
-                    rising_edge_after=1_500_000)
-                e = HVAASurvivalEveryNStepsBonus(e, every_n_steps=50, bonus=0.05)
-
-                if args.expert_blending:
-                    expert = SimpleAggressiveExpert(
-                        fire_threshold=0.50, 
-                        aspect_limit_deg=30.0,
-                        debug=False
-                    )
-                    obs_indices = get_default_obs_indices()  # 27-dim base indices
-                    
-                    alpha_decay = create_alpha_decay_fn(
-                        initial_alpha=args.initial_alpha,
-                        final_alpha=args.final_alpha,
-                        decay_start=args.alpha_decay_start,
-                        decay_end=args.alpha_decay_end,
-                        decay_type=args.alpha_decay_type,
-                    )
-                    
-                    e = ExpertActionBlendingWrapper(
-                        e, 
-                        expert=expert, 
-                        obs_indices=obs_indices,
-                        alpha_fn=alpha_decay,
-                        blend_dims=[0, 1, 2],  # Blend turn, altitude, g_force
-                        fire_blend_mode=args.fire_blend_mode,
-                        fire_gate_threshold=0.3,
-                        debug=False,
-                    )
-                    print(f"✓ Expert action blending wrapper added")
-                    print(f"  Initial alpha: {args.initial_alpha} (expert influence)")
-                    print(f"  Final alpha: {args.final_alpha}")
-                    print(f"  Decay: {args.alpha_decay_start:,} → {args.alpha_decay_end:,} steps ({args.alpha_decay_type})")
-                    print(f"  Fire mode: {args.fire_blend_mode}")
-
-
-                obs, _ = e.reset()
-                print(f"Actual enriched Shape:")
-                print("obs[0:30] =", np.round(obs[:30], 3))
-                print(f"Original Printout:")
-                print(f"Obs shape: {obs.shape}")
-                print(f"Indices 27-35: {obs[27:35]}")
-
-                print(f"\n✓ Environment created with enriched observations")
-                print(f"   Final observation space: {e.observation_space}")
-                print(f"   Observation dimension: {e.observation_space.shape[0]}")
-                # --- Reward shaping disabled for baseline run ---
-
-                # --- Hierarchical action wrapper disabled for baseline run ---
                 
-                 # ================= HVAA DEBUG BLOCK =================
-                if DEBUG_HVAA_OBS:
-                    try:
-                        # Unwrap down to the SingleAgentBACEEnv and the multi-agent B_ACE wrapper
-                        # e: RewardShapingWrapper -> EnrichedObservationWrapper -> SingleAgentBACEEnv
-                        rs_wrapper = e
-                        enriched_wrapper = rs_wrapper.env
-                        single_env = enriched_wrapper.env
-                        ma_env = single_env._ma_env  # B_ACE_GodotPettingZooWrapper
-
-                        # Get HVAA indices for the controlled agent
-                        if hasattr(ma_env, "get_hvaa_indices") and hasattr(ma_env, "possible_agents"):
-                            agent_name = single_env.controlled_agent_id
-                            hv_idx = ma_env.get_hvaa_indices(agent_name)
-                            print("\n" + "="*70)
-                            print("[HVAA DEBUG] HVAA index mapping for agent:", agent_name)
-                            for label, idx in hv_idx.items():
-                                print(f"  {label:15s} -> index {idx}")
-                            
-                            # Get one sample observation AFTER all wrappers (enriched obs)
-                            # This is exactly what the policy sees.
-                            sample_obs, _ = e.reset(seed=seed)
-                            print("\n[HVAA DEBUG] Sample enriched observation shape:", sample_obs.shape)
-
-                            # Print the values at the HVAA indices
-                            print("[HVAA DEBUG] HVAA-related values from observation:")
-                            for label, idx in hv_idx.items():
-                                if 0 <= idx < len(sample_obs):
-                                    print(f"  idx {idx:3d} | {label:15s} = {sample_obs[idx]: .6f}")
-                                else:
-                                    print(f"  idx {idx:3d} | {label:15s} = <OUT OF RANGE>")
-
-                            print("="*70 + "\n")
-                        else:
-                            print("[HVAA DEBUG] ma_env has no get_hvaa_indices or possible_agents; type:", type(ma_env))
-                    except Exception as ex:
-                        print("[HVAA DEBUG] Exception while probing HVAA obs:", ex)
-                # =============== END HVAA DEBUG BLOCK ===============
-
+                # Store base observation dimension for split normalization
+                base_obs_dim = e.original_obs_dim
+                print(f"  [Enriched Obs] Config: {args.ablation_config}")
+                print(f"  [Enriched Obs] Base dim: {base_obs_dim}, Enriched dim: {e.observation_space.shape[0]}")
+                print(f"  [Enriched Obs] Added features: {e.num_added_features}")
+                
+                # Apply split normalization: normalizes base features, passes enriched features through unchanged
+                # This REPLACES VecNormalize's observation normalization for enriched observations
+                e = SplitNormalizationWrapper(e, base_obs_dim=base_obs_dim)
+                print(f"  [Split Normalization] Applied - base features normalized, enriched features passed through")
             else:
                 print("\n" + "="*60)
-                print("USING DMC ONLY")
+                print("USING BASELINE OBSERVATIONS (NO THEORETICAL FEATURES)")
                 print("="*60 + "\n")
 
-            '''
-            # DEBUG: Print observation info - FINAL VERSION
-            print("\n" + "="*60)
-            print("OBSERVATION SPACE DEBUG INFO")
-            print("="*60)
-            print(f"Observation space shape: {e.observation_space}")
-            
-            # The labels are in the multi-agent wrapper
-            ma_env = e._ma_env  # Get the B_ACE_GodotPettingZooWrapper
-            
-            print(f"\n--- Observation Labels from Godot ---")
-            if hasattr(ma_env, 'observation_labels'):
-                for agent_id, labels in ma_env.observation_labels.items():
-                    print(f"\nAgent ID {agent_id}:")
-                    if isinstance(labels, list):
-                        for i, label in enumerate(labels):
-                            print(f"  [{i:2d}] {label}")
-                    else:
-                        print(f"  {labels}")
-            
-            print(f"\n--- Obs Map ---")
-            if hasattr(ma_env, 'obs_map'):
-                for agent_name, mapping in ma_env.obs_map.items():
-                    print(f"\n{agent_name}:")
-                    # Sort by index for readability
-                    sorted_mapping = sorted(mapping.items(), key=lambda x: x[1])
-                    for label, idx in sorted_mapping:
-                        print(f"  [{idx:2d}] {label}")
-            
-            # Get a sample observation with values
-            test_obs, _ = e.reset()
-            print(f"\n--- Sample Observation Values ---")
-            print(f"Shape: {test_obs.shape}")
-            
-            # Try to match labels with values
-            if hasattr(ma_env, 'obs_map') and 'agent_0' in ma_env.obs_map:
-                mapping = ma_env.obs_map['agent_0']
-                sorted_mapping = sorted(mapping.items(), key=lambda x: x[1])
-                print(f"\nLabeled values:")
-                for label, idx in sorted_mapping:
-                    if idx < len(test_obs):
-                        print(f"  [{idx:2d}] {label:30s} = {test_obs[idx]:12.6f}")
-            else:
-                # Just print indexed values
-                for i, val in enumerate(test_obs):
-                    print(f"  [{i:2d}] {val:12.6f}")
-            
-            print("="*60 + "\n")
-            # END DEBUG
-            '''
+            # === SHAPING WRAPPERS (ALWAYS APPLIED) ===
+            e = HeadingRateLimitWrapper(e, hdg_idx=0, max_delta=0.15)
 
+            e = KillRewardWrapper(e, kill_reward=12.0)
+
+            e = ActionSmoothnessPenalty(
+                e,
+                hdg_idx=0,
+                jerk_start=0.0, jerk_end=0.0025,
+                mag_start=0.0,  mag_end=0.012,
+                hold_steps=1_500_000,
+                anneal_steps=4_500_000
+            )
+
+            e = MissionTempoShapingPerStep(
+                e,
+                penalty_per_step=-0.003,  # While red alive
+                bonus_per_step=0.006,     # After red killed
+                require_hvaa_alive=True,
+            )
+
+            e = SustainedTurnPenaltySimple(
+                e,
+                hdg_idx=0,
+                window_size=15,
+                turn_threshold=0.5,
+                penalty_coef=0.01,  # increase if still spinning
+            )
+            
+            #e = RangeClosingShaping(
+            #    e, 
+            #    range_idx=17, 
+            #    track_idx=26,
+            #    k=30.0,              # 30x increase from k=1.0
+            #    clip_delta=0.02,     # Keep current
+            #    max_valid_delta=0.05 # Filter anomalies
+            #)
+
+            e = CombinedTrackAwareShaping(
+                e,
+                range_idx=17,
+                track_idx=26,
+                track_loss_penalty=-0.3,
+                k_close=40.0,
+                asymmetry_ratio=2.0,
+                clip_delta=0.02,            # Filter large single-step deltas
+                max_valid_delta=0.05,       # Ignore anomalous jumps (target destroyed/respawned)
+                min_range_for_penalty=0.05, # Don't penalize opening when already very close
+            )
+
+            e = FireCooldownWrapper(
+                e,
+                fire_idx=3,
+                cd_start=70,
+                cd_end=120,
+                cd_hold=10_000,
+                cd_steps=5_000_000
+                #rising_edge_after=1_500_000
+            )
+            
+            e = HVAASurvivalEveryNStepsBonus(e, every_n_steps=25, bonus=0.01)
+            # DISABLED: Large instant penalty creates high variance and credit assignment issues
+            # The survival bonus provides dense positive signal instead
+            # e = HVAADestructionPenalty(e, penalty=-15.0)
+
+            # === EXPERT ALIGNMENT (TRAINING ONLY) ===
+            if args.expert_alignment and not is_eval:
+                expert = AggressiveHunterFixed(debug=False)
+                obs_indices = get_default_obs_indices()  # 27-dim base indices for expert
+                alignment_decay = create_alignment_decay_fn(
+                    decay_start=args.alignment_decay_start,
+                    decay_end=args.alignment_decay_end,
+                    final_multiplier=0.3,
+                )
+                e = ExpertAlignmentWrapper(
+                    e, expert=expert, obs_indices=obs_indices,
+                    alignment_coef=args.alignment_coef,
+                    action_weights=np.array([1.0, 0.3, 0.6, 0.5]),
+                    decay_fn=alignment_decay,
+                )
+                print(f"✓ Expert alignment wrapper added (TRAINING ONLY)")
+            elif args.expert_alignment and is_eval:
+                print(f"ℹ Expert alignment SKIPPED for evaluation environment")
+
+            # === DEBUG OUTPUT ===
+            obs, _ = e.reset()
+            print(f"\n✓ Environment created")
+            print(f"   Observation dimension: {obs.shape[0]}")
+            print(f"   obs[0:10] = {np.round(obs[:10], 3)}")
+            
+            if args.use_enriched_obs and obs.shape[0] > 27:
+                print(f"   Enriched features [27:]: {np.round(obs[27:], 3)}")
+
+            # === FINAL WRAPPERS ===
+            e = CompactRewardLogger(e, print_every_n=10) 
             e = NanGuardWrapper(e, name=("eval_env" if is_eval else "train_env"))
+
+            # === DEBUG: TERMINATION TRACE (pre-Monitor) ===
+            class _TermTrace(gym.Wrapper):
+                def __init__(self, env): 
+                    super().__init__(env)
+                    self._steps = 0
+                def reset(self, **kw):
+                    self._steps = 0
+                    return self.env.reset(**kw)
+                def step(self, action):
+                    o, r, term, trunc, i = self.env.step(action)
+                    self._steps += 1
+                    if term or trunc:
+                        print(f"[PRE-MONITOR] step={self._steps} term={term} trunc={trunc}")
+                    return o, r, term, trunc, i
+            e = _TermTrace(e)
+            # === END DEBUG ===
+
             e = Monitor(e, filename=str(Path(log_dir_str) / "monitor.csv"))
-            # === DEBUG: confirm final observation shape ===
+            
             obs, _ = e.reset(seed=seed)
             print(f"[DEBUG] Final observation shape: {obs.shape}")
-            # Optional safety check if you expect exactly 47 features:
-            # assert obs.shape[0] == 47, f"Expected 47-dim obs, got {obs.shape}"
-            #e.reset(seed=seed)
             return e
         return _thunk
 
     vec_env = DummyVecEnv([make_env(log_dir.as_posix(), args.seed)])
 
-    vec_env = VecNormalize(
-        vec_env,
-        norm_obs=True,
-        norm_reward=False,
-        clip_obs=10.0,
-        clip_reward=10.0,
-    )
+    # CRITICAL: When using enriched observations, SplitNormalizationWrapper handles
+    # observation normalization. VecNormalize should NOT re-normalize observations.
+    # For baseline observations, VecNormalize handles all normalization.
+    if args.use_enriched_obs:
+        print("\n[VecNormalize] norm_obs=False (handled by SplitNormalizationWrapper)")
+        vec_env = VecNormalize(
+            vec_env,
+            norm_obs=False,   # CRITICAL: Already normalized by SplitNormalizationWrapper
+            norm_reward=False,
+            clip_obs=10.0,
+            clip_reward=10.0,
+        )
+    else:
+        print("\n[VecNormalize] norm_obs=True (baseline observations)")
+        vec_env = VecNormalize(
+            vec_env,
+            norm_obs=True,    # Standard normalization for baseline
+            norm_reward=False,
+            clip_obs=10.0,
+            clip_reward=10.0,
+        )
     print_wrapper_stack(vec_env, name="TRAIN vec_env (after VecNormalize)")
 
     print(f"[NEW***DEBUG] vec_env.observation_space: {vec_env.observation_space}")
@@ -1956,23 +2078,6 @@ def main():
     # Create PPO model with decay schedules and seed
     layer_sizes = [args.layer_size] * args.n_layers
     policy_kwargs = dict(net_arch=[dict(pi=layer_sizes, vf=layer_sizes)])
-
-
-    # --- Expert-mixing curriculum (policy-side, Fix A) ---
-    # Use SB3 global timesteps (self.num_timesteps) so the schedule never resets per-episode.
-    '''
-    expert_initial_greedy = 0.01
-    expert_final_greedy = 1.0
-    expert_curriculum_steps = 1_000_000
-
-    def greedy_prob_fn(t: int) -> float:
-        if t <= 0:
-            return float(expert_initial_greedy)
-        if t >= expert_curriculum_steps:
-            return float(expert_final_greedy)
-        frac = float(t) / float(expert_curriculum_steps)
-        return float(expert_initial_greedy + frac * (expert_final_greedy - expert_initial_greedy))
-    '''
 
     def greedy_prob_fn(t: int) -> float:
         p_start = 1.0
@@ -2017,7 +2122,7 @@ def main():
         ent_coef=args.initial_entropy_coef,  # Start with initial value (float)
         vf_coef=args.vf_coef,
         max_grad_norm=0.5,
-        target_kl=0.02,
+        target_kl=0.05,
         verbose=1,
         tensorboard_log=log_dir.as_posix(),
         device=args.device,
@@ -2038,21 +2143,40 @@ def main():
 
     
     # Wrap with VecNormalize but set training=False
-    eval_env = VecNormalize(
-        eval_env,
-        norm_obs=True,
-        norm_reward=False,  # Don't normalize rewards during eval
-        clip_obs=10.0,
-        clip_reward=10.0,
-        training=False,  # Important: don't update normalization stats during eval
-    )
+    # CRITICAL: Must match training env's norm_obs setting
+    if args.use_enriched_obs:
+        print("\n[Eval VecNormalize] norm_obs=False (matching training - handled by SplitNormalizationWrapper)")
+        eval_env = VecNormalize(
+            eval_env,
+            norm_obs=False,   # CRITICAL: Match training env - SplitNormalizationWrapper handles it
+            norm_reward=False,  # Don't normalize rewards during eval
+            clip_obs=10.0,
+            clip_reward=10.0,
+            training=False,  # Important: don't update normalization stats during eval
+        )
+    else:
+        print("\n[Eval VecNormalize] norm_obs=True (matching training - baseline observations)")
+        eval_env = VecNormalize(
+            eval_env,
+            norm_obs=True,    # Match training env - standard normalization
+            norm_reward=False,  # Don't normalize rewards during eval
+            clip_obs=10.0,
+            clip_reward=10.0,
+            training=False,  # Important: don't update normalization stats during eval
+        )
 
     print_wrapper_stack(eval_env, name="EVAL eval_env (after VecNormalize)")
     
     # Sync normalization stats from training env to eval env
-    # This will be updated automatically during training
-    eval_env.obs_rms = vec_env.obs_rms
-    eval_env.ret_rms = vec_env.ret_rms
+    # Only sync if using norm_obs=True (when NOT using enriched observations)
+    # With enriched observations, SplitNormalizationWrapper handles normalization
+    # and VecNormalize doesn't create obs_rms
+    if hasattr(vec_env, 'obs_rms') and vec_env.obs_rms is not None:
+        eval_env.obs_rms = vec_env.obs_rms
+        print("  [Normalization] Synced obs_rms from training to eval env")
+    if hasattr(vec_env, 'ret_rms') and vec_env.ret_rms is not None:
+        eval_env.ret_rms = vec_env.ret_rms
+        print("  [Normalization] Synced ret_rms from training to eval env")
     
     print(f"✓ Evaluation environment created")
     print(f"  Eval episodes: 10")
@@ -2068,6 +2192,25 @@ def main():
     )
     
     # 2. Evaluation-based checkpoint callback (saves best model based on eval performance)
+    #    With buffer mismatch handling and entropy decay on rollback
+    eval_checkpoint_callback = RollbackEvaluationCallbackTopK(
+        eval_env=eval_env,
+        eval_freq=200000,
+        n_eval_episodes=15,
+        log_dir=log_dir,
+        max_checkpoints=5,
+        rollback_patience=6,
+        deficit_threshold=40.0,
+        min_timesteps_before_rollback=4_000_000,
+        lr_decay_factor=0.7,           # Less aggressive (was 0.5)
+        entropy_decay_factor=0.5,
+        min_lr_multiplier=0.4,
+        max_rollbacks=5,               # Limited rollbacks (was 10)
+        skip_initial_eval=True,
+        activation_threshold=12.0,
+        freeze_vecnormalize_until_new_best=True,  # ← NEW: Permanent freeze!
+        verbose=1,
+    )
     '''
     eval_checkpoint_callback = EvaluationBasedCheckpointCallback(
         eval_env=eval_env,
@@ -2077,14 +2220,14 @@ def main():
         verbose=1,
         deterministic=True  # Use deterministic actions during evaluation
     )
-    '''
+    
     # 2. Evaluation-based checkpoint callback with component tracking
     if COMPONENT_TRACKING_AVAILABLE:
         print("✓ Using RewardComponentEvalCallback (with component tracking)")
         eval_checkpoint_callback = RewardComponentEvalCallback(
             eval_env=eval_env,
             eval_freq=200000,  # Evaluate every 50k steps
-            n_eval_episodes=10,  # Run 20 episodes per evaluation
+            n_eval_episodes=15,  # Run 20 episodes per evaluation
             log_dir=log_dir,
             verbose=1,
             deterministic=True  # Use deterministic actions during evaluation
@@ -2094,12 +2237,12 @@ def main():
         eval_checkpoint_callback = EvaluationBasedCheckpointCallback(
             eval_env=eval_env,
             eval_freq=200000,
-            n_eval_episodes=10,
+            n_eval_episodes=15,
             log_dir=log_dir,
             verbose=1,
             deterministic=True
     )
-
+    '''
 
     # Combine callbacks
     callback_list = CallbackList([metrics_callback, eval_checkpoint_callback])

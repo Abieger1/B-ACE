@@ -18,60 +18,84 @@ python rl_files/evaluate_single_model_multi_seed.py \
     --renderize 1
 
 # Evaluate all seeds in an experiment:
-python rl_files/evaluate_experiment_seeds.py 
---experiment-dir runs_sb3/my_experiment 
---episodes 100
+python rl_files/evaluate_experiment_seeds.py \
+--experiment-dir runs_sb3/experiment_D_2 \
+--episodes 200
+
+python rl_files/evaluate_experiment_seeds.py \
+  --experiment-dir runs_sb3/experiment_D_2 \
+  --episodes 200 \
+  --speed-up 500
 
 
 
 
 # EXPERIMENTAL RUN WITH SEEDS 42, 123, 456, 789, 1011
 python rl_files/run_experiment.py \
-    --experiment-name experiment_ABC_v2 \
+    --experiment-name experiment_D_2 \
     --total-timesteps 10_000_000 \
-    --seeds 42 123 456 789 \
+    --seeds 123 456 789 \
+    --expert-alignment \
+    --alignment-coef 0.01
+
+    
     --use-enriched-obs \
     --ablation-config 
     
 
-    --log-to-file
 
 
 #CONFIG 1 - Clean PPO Training
 python rl_files/train_bace_clean.py \
-  --experiment-name experiment_ABC_V10 \
+  --experiment-name experiment_E \
   --seed 42 \
   --total-timesteps 10000000 \
+  --expert-blending \
   --use-enriched-obs \
   --ablation-config all
+
+  --expert-alignment \
+  --alignment-coef 0.1
   
-   \
+  --use-enriched-obs \
   --expert_alignment
 
+python rl_files/train_bace_clean_expert_alignment.py \
+  --experiment-name experiment_D \
+  --seed 42 \
+  --total-timesteps 10000000 \
+  --expert-alignment
 
-# A GEOMETRY only (Apollonius + ATDDG)
-python run_experiment.py --experiment-name geometry_only \
-    --use-enriched-obs --ablation-config geometry_only
+  --use-enriched-obs \
 
-# B ENGAGEMENT only (BEZ + DMC + WEZ)
-python run_experiment.py --experiment-name engagement_only \
-    --use-enriched-obs --ablation-config engagement_only
 
-# C RANGE_LIMITED only (escape cone + capture prob)
-python run_experiment.py --experiment-name range_only \
-    --use-enriched-obs --ablation-config range_limited_only
+#Configurations:
+# All enriched features (default when --use-enriched-obs is set)
+python train_bace_clean_fixed.py --use-enriched-obs --seed 42
 
-# GEOMETRY + ENGAGEMENT (no range-limited)
-python run_experiment.py --experiment-name geo_eng \
-    --use-enriched-obs --ablation-config geometry_engagement
+# Geometry only (disable all engagement features)
+python train_bace_clean_fixed.py --use-enriched-obs \
+    --disable-bez --disable-dmc --disable-offense-wez --disable-offense-ttc \
+    --seed 42
 
-# GEOMETRY + RANGE_LIMITED (no engagement)
-python run_experiment.py --experiment-name geo_range \
-    --use-enriched-obs --ablation-config geometry_range
+# Engagement only (disable geometry)
+python train_bace_clean_fixed.py --use-enriched-obs \
+    --disable-apollonius \
+    --seed 42
 
-# ENGAGEMENT + RANGE_LIMITED (no geometry)
-python run_experiment.py --experiment-name eng_range \
-    --use-enriched-obs --ablation-config engagement_range
+# DMC only
+python train_bace_clean_fixed.py --use-enriched-obs \
+    --disable-apollonius --disable-bez --disable-offense-wez --disable-offense-ttc \
+    --seed 42
+
+# With expert alignment + specific features
+python train_bace_clean_fixed.py --use-enriched-obs \
+    --disable-offense-ttc --disable-multi-threat \
+    --expert-alignment --alignment-coef 0.1 \
+    --seed 42
+
+# Baseline (no enriched features)
+python train_bace_clean_fixed.py --seed 42
 
 
 #PLOTTING SECTION - Seed 125, 456, 789, 1011
@@ -91,16 +115,16 @@ python rl_files/plot_eval_learning_curve_updated.py \
 
 # Plot multiple specific seeds
 python rl_files/plot_eval_learning_curve_updated.py \
-    --experiment-dir runs_sb3/baseline_experiment_v6/ \
-    --output-file baseline_seeds_42_v6.png \
-    --seeds seed42 \
-    --title "Baseline Seeds 42 & 123"
+    --experiment-dir runs_sb3/experiment_Baseline/ \
+    --output-file baseline_seeds.png \
+    --seeds seed42 seed123 seed456 seed1011 \
+    --title "Baseline Seeds"
 
 # Plot all seeds (default behavior, unchanged)
 python rl_files/plot_eval_learning_curve_updated.py \
-    --experiment-dir runs_sb3/experiment_abc_v10/ \
-    --output-file abc_v10.png \
-    --title "Baseline All Seeds"
+    --experiment-dir runs_sb3/experiment_ABC_V3/ \
+    --output-file experiment_ABC_V3.png \
+    --title "Experiment D - All Seeds"
 
 #PLOT AVERAGE AMONG SSEEDS
 python rl_files/plot_multiseed_learning_curve.py \
@@ -154,6 +178,19 @@ python rl_files/train_bace_config3.py --expert-blending \
 
 
 #Test Expert Standalone
-python rl_files/test_config3_blending.py
-python rl_files/test_expert_standalone.py --episodes 10 --render --verbose
-python rl_files/test_expert_standalone.py --config configs/Scen_1_config.json --episodes 20
+python rl_files/test_expert_standalone.py --expert hunter_fixed --episodes 20 --render --verbose
+
+python rl_files/test_expert_standalone.py --expert all --episodes 20
+# Focused sweep (10 configs) - good starting point
+python rl_files/expert_sweep_bace.py --config b_ace_py/SimpleExample_B_ACE_config.json --episodes 20
+
+# More episodes for better statistics
+python expert_sweep_bace.py --config your_config.json --episodes 50
+
+# Full grid search (256 configs - will take a while!)
+python rl_files/expert_sweep_bace.py --config b_ace_py/SimpleExample_B_ACE_config.json --episodes 20 --full-sweep
+
+# Verbose mode to see each episode
+python expert_sweep_bace.py --config your_config.json --episodes 10 --verbose
+
+python rl_files/test_expert_standalone.py --config b_ace_py/SimpleExample_B_ACE_config.json --episodes 20
